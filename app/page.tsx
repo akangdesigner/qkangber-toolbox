@@ -2,8 +2,8 @@ import Link from 'next/link'
 
 const tools = [
   { href: '/haixun', title: 'Threads 海巡控制台', desc: '審核候選、編輯草稿、一鍵核准發送', ready: true },
-  { href: '#', title: 'HTML 文章編輯器', desc: '（階段 2 搬移中）', ready: false },
-  { href: '#', title: '社群貼文產生器', desc: '（階段 2 搬移中）', ready: false },
+  { href: '/tools/html-editor', title: 'HTML 文章編輯器', desc: '草稿轉圖床、一鍵發布到 Google Sheets', ready: true },
+  { href: '/tools/social-post', title: '社群貼文產生器', desc: '長文拆成主貼文＋第一則留言', ready: true },
 ]
 
 export default function Dashboard() {
