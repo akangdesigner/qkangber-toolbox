@@ -4,6 +4,7 @@
 /build
 .env*
 !.env.example
+.threads-token.json
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store

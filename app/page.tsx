@@ -1,6 +1,7 @@
 import Link from 'next/link'
 
 const tools = [
+  { href: '/news', title: '新聞轉發控制台', desc: '看候選新聞、改草稿、直接發 Threads 或複製自己發', ready: true },
   { href: '/haixun', title: 'Threads 海巡控制台', desc: '審核候選、編輯草稿、一鍵核准發送', ready: true },
   { href: '/tools/html-editor', title: 'HTML 文章編輯器', desc: '草稿轉圖床、一鍵發布到 Google Sheets', ready: true },
   { href: '/tools/social-post', title: '社群貼文產生器', desc: '長文拆成主貼文＋第一則留言', ready: true },
@@ -9,11 +10,8 @@ const tools = [
 export default function Dashboard() {
   return (
     <main className="max-w-3xl mx-auto px-6 py-12">
-      <div className="flex items-center justify-between mb-10">
+      <div className="mb-10">
         <h1 className="text-2xl font-semibold text-white">Q kangber 工具箱</h1>
-        <form action="/api/logout" method="post">
-          <button className="text-sm text-slate-400 hover:text-slate-200" formAction="/api/logout">登出</button>
-        </form>
       </div>
       <div className="grid sm:grid-cols-2 gap-4">
         {tools.map((t) => (
