@@ -30,6 +30,8 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [withImg, setWithImg] = useState<Record<string, boolean>>({})
   const [busy, setBusy] = useState<string | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
+  const [saving, setSaving] = useState<string | null>(null)
+  const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
   const [lang, setLang] = useState<'all' | 'zh' | 'en'>('all')
   const [posted, setPosted] = useState<PostedLog[]>(history)
@@ -95,6 +97,56 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
     setCandidates((prev) => prev.filter((x) => x.原文連結 !== c.原文連結))
   }
 
+  async function saveImage(c: Candidate) {
+    if (!c.圖片連結) return
+    setSaving(c.原文連結)
+    try {
+      const res = await fetch('/api/news/save-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 圖片連結: c.圖片連結, 來源: c.來源, 標題: c.標題 }),
+      })
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}))
+        alert('存圖失敗：' + (json.error || res.status))
+        setSaving(null)
+        return
+      }
+      const blob = await res.blob()
+      const name = decodeURIComponent(res.headers.get('X-Filename') || '') || 'news.jpg'
+
+      // Chrome / Edge：跳另存視窗、預設開在桌面
+      const picker = (window as unknown as { showSaveFilePicker?: (o: unknown) => Promise<FileSystemFileHandle> }).showSaveFilePicker
+      if (picker) {
+        try {
+          const handle = await picker({ suggestedName: name, startIn: 'desktop' })
+          const w = await handle.createWritable()
+          await w.write(blob)
+          await w.close()
+        } catch (err) {
+          if ((err as DOMException)?.name === 'AbortError') {
+            setSaving(null)
+            return // 使用者自己取消，不算失敗
+          }
+          throw err
+        }
+      } else {
+        // 不支援（如 Safari）：退回一般下載，進「下載」資料夾
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = name
+        a.click()
+        URL.revokeObjectURL(url)
+      }
+      setSaved(c.原文連結)
+      setTimeout(() => setSaved((v) => (v === c.原文連結 ? null : v)), 2000)
+    } catch (e) {
+      alert('存圖失敗：' + e)
+    }
+    setSaving(null)
+  }
+
   async function copy(c: Candidate) {
     const vkey = tab[c.原文連結] ?? '感性'
     const text = drafts[c.原文連結]?.[vkey] ?? ''
@@ -138,15 +190,24 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
                     withImg[id] ? 'border-violet-400/50 opacity-100' : 'border-white/10 opacity-40'
                   }`}
                 />
-                <label className="mt-2 flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={!!withImg[id]}
-                    onChange={(e) => setWithImg((m) => ({ ...m, [id]: e.target.checked }))}
-                    className="accent-violet-500"
-                  />
-                  發文時連同這張圖一起發
-                </label>
+                <div className="mt-2 flex items-center gap-3">
+                  <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={!!withImg[id]}
+                      onChange={(e) => setWithImg((m) => ({ ...m, [id]: e.target.checked }))}
+                      className="accent-violet-500"
+                    />
+                    發文時連同這張圖一起發
+                  </label>
+                  <button
+                    onClick={() => saveImage(c)}
+                    disabled={saving === id}
+                    className="ml-auto rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 px-3 py-1 text-xs text-slate-300"
+                  >
+                    {saving === id ? '存檔中…' : saved === id ? '已存到桌面 ✓' : '存到桌面'}
+                  </button>
+                </div>
               </div>
             )}
             {c.原文連結 && (
