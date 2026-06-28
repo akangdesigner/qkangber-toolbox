@@ -24,7 +24,7 @@ export type StockHealth = {
   macdTrend: '多方動能' | '空方動能' // 柱>0 / 柱<0
   dif: number
   signal: 'green' | 'yellow' | 'red' // 紅綠燈
-  entry: '接近買點' | '強勢偏貴' | '盤整觀望' | '轉弱避開' // 用 SOP 判讀現在的進場時機
+  entry: '帶量突破' | '接近買點' | '強勢偏貴' | '盤整觀望' | '轉弱避開' // 用 SOP 判讀現在的進場時機（帶量突破＝糾結末端爆量起漲）
   // ---- 量價（成交量配合）----
   vol: number | null // 最新成交量（張＝股數/1000）
   volRatio: number | null // 量比＝今量 ÷ 近 5 日均量（>1 放量、<1 縮量）
@@ -33,6 +33,10 @@ export type StockHealth = {
   pe: number | null // 本益比（估值貴不貴，越高越貴；虧損/ETF 無值）
   pb: number | null // 股價淨值比
   dividendYield: number | null // 殖利率 %
+  // ---- 波動度（風險：這檔會跳多大）----
+  volatilityPct: number // 近60日「平均每日漲跌幅絕對值」%，越大越會跳
+  range60Pct: number // 近60日收盤高低振幅 %（最高比最低高多少）
+  volLabel: '低波' | '中波' | '高波' // 波動分級：日均<1.5%低、1.5~3%中、>3%高
   verdict: string // 一句話結論（技術面）
   // ---- 基本盤（體質）判定：成長(月營收YoY) + 估值(PE/PB/殖利率) ----
   revYoY: number | null // 單月營收年增率 %（最新公布月份；ETF/無資料為 null）
@@ -49,6 +53,7 @@ export type StockHealth = {
   chipDate: string | null // 籌碼資料日期，如 2026/06/23
   chipForeignStreak: number // 外資連續買/賣超天數（正=連買、負=連賣、0=無）
   chipTrustStreak: number // 投信連續買/賣超天數（正=連買、負=連賣、0=無）
+  chipBothBuy: boolean // 三大法人「同買」：外資與投信最近交易日同步買超（極強短線領先訊號）
   chipSignal: 'buy' | 'sell' | 'neutral' | 'na' // 籌碼方向（na=查無資料）
   chipText: string // 一句話籌碼說明
   // ---- 綜合評分：技術 / 基本 / 籌碼 三柱各 0~100，加權成總分 ----
@@ -56,7 +61,7 @@ export type StockHealth = {
   chipScore: number | null // 籌碼面分數 0~100（na 為 null）
   overallScore: number // 總分 0~100（依有資料的柱子加權）
   overallVerdict: string // 總分結論＋各柱原因
-  series: { close: number[]; ma20: (number | null)[]; ma60: (number | null)[]; k: number[]; d: number[] } // 畫圖用，最近約 120 個交易日
+  series: { close: number[]; open: number[]; high: number[]; low: number[]; ma20: (number | null)[]; ma60: (number | null)[]; k: number[]; d: number[] } // 畫圖用（含 K 棒 OHLC），最近約 120 個交易日
 }
 
 // ---------- 指標計算 ----------
@@ -154,30 +159,46 @@ async function fetchYahoo(ySymbol: string): Promise<{ candles: Candle[]; meta: Y
 }
 
 // 中文名稱對照表：TWSE（上市含 ETF）+ TPEx（上櫃），整批抓一次快取 12 小時
-let nameCache: { map: Record<string, string>; at: number } | null = null
+// full=兩個來源都抓到 → 快取 12 小時；殘缺（某來源失敗）只快取 30 分鐘，逼下次補抓，
+// 避免「只有上櫃名單」被長快取、害上市股票全顯示英文。
+const NAME_TTL_FULL = 12 * 3600 * 1000
+const NAME_TTL_PARTIAL = 30 * 60 * 1000
+let nameCache: { map: Record<string, string>; at: number; full: boolean } | null = null
+let nameInflight: Promise<Record<string, string>> | null = null
 async function getNameMap(): Promise<Record<string, string>> {
-  if (nameCache && Date.now() - nameCache.at < 12 * 3600 * 1000) return nameCache.map
-  const map: Record<string, string> = {}
+  if (nameCache && Date.now() - nameCache.at < (nameCache.full ? NAME_TTL_FULL : NAME_TTL_PARTIAL)) return nameCache.map
+  if (nameInflight) return nameInflight // single-flight：避免掃描時 12 路並發同時打表被限流 → 退英文名
+  nameInflight = (async () => {
+  // 以舊名單為底合併：單一來源這次掛掉，也不會弄丟先前已抓到的名稱
+  const map: Record<string, string> = { ...(nameCache?.map ?? {}) }
   try {
     const opts = { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store' as const }
     const [twse, tpex] = await Promise.all([
       fetch('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', opts).then((r) => (r.ok ? r.json() : [])).catch(() => []),
       fetch('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes', opts).then((r) => (r.ok ? r.json() : [])).catch(() => []),
     ])
-    for (const it of twse as Array<{ Code?: string; Name?: string }>) if (it.Code && it.Name) map[it.Code.trim()] = it.Name.trim()
-    for (const it of tpex as Array<{ SecuritiesCompanyCode?: string; CompanyName?: string }>) if (it.SecuritiesCompanyCode && it.CompanyName) map[it.SecuritiesCompanyCode.trim()] = it.CompanyName.trim()
-    if (Object.keys(map).length) nameCache = { map, at: Date.now() }
+    const tw = twse as Array<{ Code?: string; Name?: string }>
+    const tp = tpex as Array<{ SecuritiesCompanyCode?: string; CompanyName?: string }>
+    for (const it of tw) if (it.Code && it.Name) map[it.Code.trim()] = it.Name.trim()
+    for (const it of tp) if (it.SecuritiesCompanyCode && it.CompanyName) map[it.SecuritiesCompanyCode.trim()] = it.CompanyName.trim()
+    const full = tw.length > 0 && tp.length > 0 // 兩份都有資料才算完整
+    if (Object.keys(map).length) nameCache = { map, at: Date.now(), full }
   } catch {
     if (nameCache) return nameCache.map
   }
   return nameCache?.map ?? map
+  })()
+  try { return await nameInflight } finally { nameInflight = null }
 }
 
 // 估值對照表：TWSE BWIBBU_ALL（上市）+ TPEx 本益比分析（上櫃），快取 12 小時
 type Valuation = { pe: number | null; pb: number | null; yield: number | null }
 let valCache: { map: Record<string, Valuation>; at: number } | null = null
+let valInflight: Promise<Record<string, Valuation>> | null = null
 async function getValuationMap(): Promise<Record<string, Valuation>> {
   if (valCache && Date.now() - valCache.at < 12 * 3600 * 1000) return valCache.map
+  if (valInflight) return valInflight // single-flight
+  valInflight = (async () => {
   const map: Record<string, Valuation> = {}
   const num = (v: unknown) => {
     const n = Number(String(v ?? '').replace(/,/g, ''))
@@ -198,14 +219,19 @@ async function getValuationMap(): Promise<Record<string, Valuation>> {
     if (valCache) return valCache.map
   }
   return valCache?.map ?? map
+  })()
+  try { return await valInflight } finally { valInflight = null }
 }
 
 // 月營收對照表：TWSE t187ap05_L（上市）+ TPEx mopsfin_t187ap05_O（上櫃），快取 12 小時
 // 每月 10 號前各家公布上月營收，是台股最即時的免費基本面成長訊號
 type Revenue = { yoy: number | null; yoyCum: number | null; month: string | null }
 let revCache: { map: Record<string, Revenue>; at: number } | null = null
+let revInflight: Promise<Record<string, Revenue>> | null = null
 async function getRevenueMap(): Promise<Record<string, Revenue>> {
   if (revCache && Date.now() - revCache.at < 12 * 3600 * 1000) return revCache.map
+  if (revInflight) return revInflight // single-flight
+  revInflight = (async () => {
   const map: Record<string, Revenue> = {}
   const num = (v: unknown) => {
     const n = Number(String(v ?? '').replace(/,/g, ''))
@@ -240,6 +266,8 @@ async function getRevenueMap(): Promise<Record<string, Revenue>> {
     if (revCache) return revCache.map
   }
   return revCache?.map ?? map
+  })()
+  try { return await revInflight } finally { revInflight = null }
 }
 
 // 法人籌碼對照表（領先指標）：抓最近 6 個交易日三大法人買賣超，算當日值＋連買/連賣天數。
@@ -265,8 +293,11 @@ function streakOf(vals: (number | null)[]): number {
   return sign * c
 }
 
+let chipInflight: Promise<Record<string, Chip>> | null = null
 async function getChipMap(): Promise<Record<string, Chip>> {
   if (chipCache && Date.now() - chipCache.at < 6 * 3600 * 1000) return chipCache.map
+  if (chipInflight) return chipInflight // single-flight：籌碼要爬 6 個交易日，更不能 12 路重複爬
+  chipInflight = (async () => {
   const opts = { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store' as const }
   // 收集最近 N 個交易日，每日一張 code → {foreign,trust,total}；[0] 為最近日
   const days: { date: string; map: Record<string, ChipDay> }[] = []
@@ -313,6 +344,8 @@ async function getChipMap(): Promise<Record<string, Chip>> {
     chipCache = { map, at: Date.now() }
   }
   return chipCache?.map ?? map
+  })()
+  try { return await chipInflight } finally { chipInflight = null }
 }
 
 // 籌碼方向判定：投信領先性最強，外資量大；合計買超為多、賣超為空；連買/連賣加註
@@ -325,6 +358,9 @@ function judgeChip(chip: Chip): { signal: StockHealth['chipSignal']; text: strin
   let signal: StockHealth['chipSignal'] = 'neutral'
   if (chip.total > 0) signal = 'buy'
   else if (chip.total < 0) signal = 'sell'
+  // 三大法人同買（外資＋投信同步買超）：強短線領先訊號，優先標註
+  const bothBuy = f > 0 && t > 0
+  if (bothBuy) parts.push('外資投信同買')
   // 連買/連賣補述（投信連買 = 波段起點訊號）
   const streaks: string[] = []
   if (chip.trustStreak >= 2) streaks.push(`投信連買 ${chip.trustStreak} 天`)
@@ -345,7 +381,8 @@ function scoreTechnical(s: Pick<StockHealth, 'aboveMa60' | 'arrange' | 'macdHist
   else if (s.kdCross === '死亡交叉') t -= 5
   if (s.kdZone === '超賣') t += 3
   else if (s.kdZone === '超買') t -= 3
-  if (s.entry === '接近買點') t += 8
+  if (s.entry === '帶量突破') t += 12 // 糾結末端爆量起漲，最強進場訊號
+  else if (s.entry === '接近買點') t += 8
   else if (s.entry === '轉弱避開') t -= 8
   else if (s.entry === '盤整觀望') t -= 3
   return Math.max(0, Math.min(100, t))
@@ -359,6 +396,7 @@ function scoreChip(chip: Chip): number | null {
   const t = chip.trust ?? 0, f = chip.foreign ?? 0
   c += t > 0 ? 8 : t < 0 ? -4 : 0 // 投信買超權重高
   c += f > 0 ? 5 : f < 0 ? -5 : 0
+  if (f > 0 && t > 0) c += 6 // 外資投信同買：綜效加分（極強領先）
   if (chip.trustStreak >= 3) c += 8
   else if (chip.trustStreak >= 2) c += 4
   else if (chip.trustStreak <= -3) c -= 6
@@ -532,6 +570,17 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     else volNote = '量價大致持平。'
   }
 
+  // 波動度（風險）：近 60 日平均每日漲跌幅絕對值 + 高低振幅。圖會自動縮放看不出大小，這裡量化出來。
+  const recentCloses = closes.slice(-Math.min(60, closes.length))
+  let dSum = 0, dN = 0
+  for (let i = 1; i < recentCloses.length; i++) {
+    if (recentCloses[i - 1] > 0) { dSum += Math.abs((recentCloses[i] - recentCloses[i - 1]) / recentCloses[i - 1]); dN++ }
+  }
+  const volatilityPct = dN ? round((dSum / dN) * 100, 2) : 0
+  const rHi = Math.max(...recentCloses), rLo = Math.min(...recentCloses)
+  const range60Pct = rLo > 0 ? round(((rHi - rLo) / rLo) * 100, 0) : 0
+  const volLabel: StockHealth['volLabel'] = volatilityPct >= 3 ? '高波' : volatilityPct >= 1.5 ? '中波' : '低波'
+
   // 畫圖序列：最近約 120 個交易日的收盤＋月線(20)＋季線(60)
   const N = Math.min(120, candles.length)
   const start = candles.length - N
@@ -539,6 +588,9 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
   const ma60s = smaSeries(closes, 60)
   const series = {
     close: closes.slice(start).map((v) => round(v)),
+    open: candles.slice(start).map((c) => round(c.open)),
+    high: candles.slice(start).map((c) => round(c.high)),
+    low: candles.slice(start).map((c) => round(c.low)),
     ma20: ma20s.slice(start).map((v) => (v == null ? null : round(v))),
     ma60: ma60s.slice(start).map((v) => (v == null ? null : round(v))),
     k: k.slice(start).map((v) => round(v, 1)),
@@ -562,10 +614,13 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
   }
 
   // 進場時機判讀（照 SOP）：要做多就要「多頭 + 剛回檔沒噴太遠(距季線≤12%) + KD 降到低檔(≤50)」
+  // 帶量突破：均線糾結末端，今日放量(量比≥1.3)收紅、且站上 5/20 短均 → 主力點火、起漲訊號
+  const breakout = volRatio != null && volRatio >= 1.3 && dayUp && price > ma5 && price > ma20
   let entry: StockHealth['entry']
   if (!aboveMa60 || arrange === '空頭排列') entry = '轉弱避開'
   else if (arrange === '多頭排列' && distMa60Pct <= 12 && kNow <= 50) entry = '接近買點'
   else if (arrange === '多頭排列') entry = '強勢偏貴'
+  else if (arrange === '糾結盤整' && breakout) entry = '帶量突破'
   else entry = '盤整觀望'
 
   // 綜合評分：技術（含量價）+ 基本 + 籌碼
@@ -601,6 +656,9 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     pe: val.pe,
     pb: val.pb,
     dividendYield: val.yield,
+    volatilityPct,
+    range60Pct,
+    volLabel,
     verdict,
     revYoY: rev.yoy,
     revYoYCum: rev.yoyCum,
@@ -615,6 +673,7 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     chipDate: chip.date,
     chipForeignStreak: chip.foreignStreak,
     chipTrustStreak: chip.trustStreak,
+    chipBothBuy: (chip.foreign ?? 0) > 0 && (chip.trust ?? 0) > 0,
     chipSignal: chipJudge.signal,
     chipText: chipJudge.text,
     techScore,
@@ -673,18 +732,34 @@ export async function getMarketOverview(): Promise<MarketOverview> {
   const get = (k: string) => indices.find((i) => i.key === k)
   const twii = get('twii'), sox = get('sox'), gspc = get('gspc'), vix = get('vix')
   let pts = 0
-  if (twii) { pts += twii.aboveMa60 ? 2 : twii.aboveMa60 === false ? -2 : 0; pts += twii.changePct > 0 ? 1 : -1 }
-  if (sox) pts += sox.changePct > 0 ? 1.5 : -1.5 // 費半對台股電子最關鍵
+  if (twii) {
+    pts += twii.aboveMa60 ? 2 : twii.aboveMa60 === false ? -2 : 0 // 趨勢：季線之上/之下
+    // 今日漲跌「看幅度」：重挫日要扣得夠重，不能跟小跌一樣只扣 1（否則綠油油還喊偏多）
+    const p = twii.changePct
+    pts += p >= 1.5 ? 2 : p > 0.3 ? 1 : p >= -0.3 ? 0 : p > -1.5 ? -1.5 : p > -3 ? -2.5 : -3.5
+  }
+  if (sox) pts += sox.changePct > 0 ? 1.5 : -1.5 // 費半對台股電子最關鍵（反映昨晚美股）
   if (gspc) pts += gspc.changePct > 0 ? 0.5 : -0.5
-  if (vix) pts += vix.price < 16 ? 1 : vix.price > 25 ? -1.5 : 0
-  const mood: MarketOverview['mood'] = pts >= 2 ? 'bullish' : pts <= -2 ? 'bearish' : 'neutral'
+  if (vix) {
+    pts += vix.price < 16 ? 1 : vix.price > 25 ? -1.5 : 0 // 絕對水位
+    pts += vix.changePct >= 15 ? -1.5 : vix.changePct >= 7 ? -1 : 0 // 跳升＝恐慌升溫，光看水位會漏掉
+  }
+  let mood: MarketOverview['mood'] = pts >= 2 ? 'bullish' : pts <= -2 ? 'bearish' : 'neutral'
+  // 保護：大盤今天自己重挫，就絕不喊「順風積極」——在綠油油的崩盤日叫新手加碼最傷
+  const dayDrop = twii ? twii.changePct : 0
+  if (dayDrop <= -2 && mood === 'bullish') mood = 'neutral'
+  if (dayDrop <= -3) mood = 'bearish'
   const moodLabel = mood === 'bullish' ? '環境偏多' : mood === 'bearish' ? '環境偏空' : '環境中性'
   const reasons: string[] = []
-  if (twii) reasons.push(twii.aboveMa60 ? '加權站上季線' : twii.aboveMa60 === false ? '加權跌破季線' : '加權方向不明')
+  if (twii) {
+    reasons.push(twii.aboveMa60 ? '加權站上季線' : twii.aboveMa60 === false ? '加權跌破季線' : '加權方向不明')
+    if (dayDrop <= -2) reasons.push(`加權今日重挫 ${Math.abs(twii.changePct)}%`)
+    else if (twii.changePct >= 2) reasons.push(`加權今日大漲 ${twii.changePct}%`)
+  }
   if (sox) reasons.push(sox.changePct >= 0 ? '費半收紅' : '費半收黑')
-  if (vix) reasons.push(vix.price < 16 ? 'VIX 平靜' : vix.price > 25 ? 'VIX 偏高' : 'VIX 中性')
+  if (vix) reasons.push(vix.changePct >= 7 ? `VIX 跳升 ${vix.changePct}%` : vix.price < 16 ? 'VIX 平靜' : vix.price > 25 ? 'VIX 偏高' : 'VIX 中性')
   const moodText =
-    (mood === 'bullish' ? '大環境順風，操作可積極些；' : mood === 'bearish' ? '大環境逆風，做多保守、控制部位；' : '大環境中性，個股表現為主；') +
+    (mood === 'bullish' ? '大環境順風，操作可積極些；' : mood === 'bearish' ? '大環境逆風，做多保守、控制部位、今天別追高；' : '大環境中性，個股表現為主，盤勢震盪別追高；') +
     reasons.join('、') + '。'
 
   const data: MarketOverview = { indices, mood, moodLabel, moodText, asOf: new Date().toISOString() }

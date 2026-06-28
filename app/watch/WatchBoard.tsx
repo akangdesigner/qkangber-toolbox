@@ -71,14 +71,25 @@ function streakTag(n: number, who: string): { txt: string; cls: string } | null 
   return null
 }
 
+// 波動度徽章：風險越高越紅（低波=平靜藍、高波=危險紅），讓使用者一眼看出「會跳多大」
+const volStyle: Record<StockHealth['volLabel'], { cls: string; hint: string }> = {
+  低波: { cls: 'bg-sky-500/15 text-sky-300 border-sky-500/40', hint: '溫和、適合長抱' },
+  中波: { cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40', hint: '中等起伏' },
+  高波: { cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40', hint: '跳很大、易被洗' },
+}
+
 // 買點徽章樣式 + 排序優先序（接近買點排最前）
 const entryStyle: Record<StockHealth['entry'], { cls: string; rank: number }> = {
-  接近買點: { cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40', rank: 0 },
-  強勢偏貴: { cls: 'bg-sky-500/15 text-sky-300 border-sky-500/40', rank: 1 },
-  盤整觀望: { cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40', rank: 2 },
-  轉弱避開: { cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40', rank: 3 },
+  帶量突破: { cls: 'bg-fuchsia-500/20 text-fuchsia-200 border-fuchsia-500/50', rank: 0 },
+  接近買點: { cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40', rank: 1 },
+  強勢偏貴: { cls: 'bg-sky-500/15 text-sky-300 border-sky-500/40', rank: 2 },
+  盤整觀望: { cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40', rank: 3 },
+  轉弱避開: { cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40', rank: 4 },
 }
 const entryRank = (r: Row) => (isErr(r) ? 99 : entryStyle[r.entry].rank)
+
+// 選股篩選的中分類 key（多選，AND 邏輯）
+type FilterKey = 'buy' | 'near' | 'breakout' | 'gold' | 'fund' | 'trust' | 'foreign' | 'bothbuy' | 'vol'
 
 export default function WatchBoard() {
   const [input, setInput] = useState('')
@@ -91,7 +102,13 @@ export default function WatchBoard() {
   const [scanRows, setScanRows] = useState<Row[]>([])
   const [scanning, setScanning] = useState(false)
   const [scanProg, setScanProg] = useState({ done: 0, total: 0 })
-  const [scanFilter, setScanFilter] = useState<'buy' | 'all'>('buy')
+  const [scanSort, setScanSort] = useState<'score' | 'gain'>('score') // 選股結果排序：總分 / 本日漲幅
+  const [filters, setFilters] = useState<Set<FilterKey>>(new Set(['buy'])) // 多選：交集(AND)；空集合＝全部
+  const toggleFilter = (k: FilterKey) => setFilters((prev) => {
+    const next = new Set(prev)
+    if (next.has(k)) next.delete(k); else next.add(k)
+    return next
+  })
   const [papers, setPapers] = useState<PaperPos[]>([]) // 模擬持股
   const [paperData, setPaperData] = useState<Row[]>([]) // 模擬持股的最新數據
   const [budget, setBudget] = useState(DEFAULT_BUDGET) // 每檔投入金額（估零股股數用）
@@ -205,7 +222,7 @@ export default function WatchBoard() {
   async function scanAI() {
     setView('scan')
     setScanRows([])
-    setScanFilter('all')
+    setFilters(new Set())
     setScanning(true)
     setScanProg({ done: 0, total: AI_STOCKS.length })
     try {
@@ -230,7 +247,7 @@ export default function WatchBoard() {
     setScanning(true)
     setView('scan')
     setScanRows([])
-    setScanFilter('buy')
+    setFilters(new Set(['buy']))
     try {
       const u = await fetch('/api/universe?n=150').then((r) => r.json())
       if (!u.ok) throw new Error(u.error || '選股池抓取失敗')
@@ -259,17 +276,61 @@ export default function WatchBoard() {
     if (row) setRows((prev) => [row, ...prev.filter((r) => r.symbol !== code)])
   }
 
+  // 一鍵把目前畫面上（已套用篩選）的股票整批加進追蹤清單
+  function addManyToWatch(codes: string[]) {
+    const toAdd = codes.filter((c) => !symbols.some((s) => s.toUpperCase() === c.toUpperCase()))
+    if (!toAdd.length) return
+    persist([...toAdd, ...symbols])
+    const newRows = scanRows.filter((r) => toAdd.includes(r.symbol) && !isErr(r))
+    setRows((prev) => [...newRows, ...prev.filter((r) => !toAdd.includes(r.symbol))])
+  }
+
   // 依目前檢視決定要顯示哪些卡片
   const inScan = view === 'scan'
   const baseRows = inScan ? scanRows : rows
   const scoreOf = (r: Row) => (isErr(r) ? -1 : r.overallScore)
   const HIGH = 60 // 總分門檻：60 以上才算「可考慮」
-  const buyCount = scanRows.filter((r) => !isErr(r) && r.overallScore >= HIGH).length
-  const filtered = inScan && scanFilter === 'buy'
-    ? baseRows.filter((r) => !isErr(r) && r.overallScore >= HIGH)
+  // 選股快捷篩選的判定（對齊四大領先指標）：總分 / 投信連買 / 帶量突破 / 法人同買
+  // 連買的最低買超張數門檻：濾掉「連買2天但只買幾張」的零頭雜訊。
+  // 外資部位天生比投信大，門檻拉高才有意義。
+  const TRUST_MIN_LOTS = 50
+  const FOREIGN_MIN_LOTS = 200
+  const filterPred: Record<FilterKey, (s: StockHealth) => boolean> = {
+    buy: (s) => s.overallScore >= HIGH,
+    near: (s) => s.entry === '接近買點',
+    breakout: (s) => s.entry === '帶量突破',
+    gold: (s) => s.kdCross === '黃金交叉' && s.arrange !== '空頭排列', // 只看「健康趨勢裡的金叉」，擋掉下跌股騙線
+    fund: (s) => s.fundSignal === 'green',
+    trust: (s) => s.chipTrustStreak >= 2 && (s.chipTrust ?? 0) >= TRUST_MIN_LOTS,
+    foreign: (s) => s.chipForeignStreak >= 2 && (s.chipForeign ?? 0) >= FOREIGN_MIN_LOTS,
+    bothbuy: (s) => s.chipBothBuy,
+    vol: (s) => s.volLabel !== '低波', // 中高波：濾掉不會動的低波，找波段標的
+  }
+  const FILTER_LABELS: Record<FilterKey, string> = {
+    buy: `總分 ${HIGH}+`, near: '接近買點', breakout: '帶量突破', gold: '黃金交叉',
+    fund: '體質佳', trust: '投信連買', foreign: '外資連買', bothbuy: '法人同買', vol: '中高波',
+  }
+  // 多選交集(AND)下，每顆 chip 顯示「再加它之後還剩幾檔」，幫使用者邊點邊看交叉結果
+  const others = (k: FilterKey) => [...filters].filter((x) => x !== k)
+  const cnt = (k: FilterKey) => scanRows.filter((r) => !isErr(r) && filterPred[k](r) && others(k).every((x) => filterPred[x](r))).length
+  const counts = Object.fromEntries((Object.keys(filterPred) as FilterKey[]).map((k) => [k, cnt(k)])) as Record<FilterKey, number>
+  // 篩選器分類：大分類（時機／體質／籌碼／波動）→ 中分類（各別條件）
+  const filterGroups: { cat: string; items: { key: FilterKey; label: string }[] }[] = [
+    { cat: '時機', items: [{ key: 'near', label: '接近買點' }, { key: 'breakout', label: '帶量突破' }, { key: 'gold', label: '黃金交叉' }] },
+    { cat: '體質', items: [{ key: 'fund', label: '體質佳' }] },
+    { cat: '籌碼', items: [{ key: 'trust', label: '投信連買' }, { key: 'foreign', label: '外資連買' }, { key: 'bothbuy', label: '法人同買' }] },
+    { cat: '波動', items: [{ key: 'vol', label: '中高波' }] },
+  ]
+  const sel = [...filters]
+  const filtered = inScan && sel.length
+    ? baseRows.filter((r) => !isErr(r) && sel.every((k) => filterPred[k](r))) // 交集：要同時符合所有選取條件
     : baseRows
-  // 主排序：總分高→低；同分用技術買點當 tiebreak
-  const displayRows = [...filtered].sort((a, b) => scoreOf(b) - scoreOf(a) || entryRank(a) - entryRank(b))
+  // 主排序：總分高→低；同分用技術買點當 tiebreak。選股結果可切「本日漲幅」榜（純收盤漲幅高→低）
+  const changeOf = (r: Row) => (isErr(r) ? -Infinity : r.changePct)
+  const sortByGain = inScan && scanSort === 'gain'
+  const displayRows = [...filtered].sort((a, b) =>
+    sortByGain ? changeOf(b) - changeOf(a) : scoreOf(b) - scoreOf(a) || entryRank(a) - entryRank(b)
+  )
 
   // 找某代號目前的最新數據（模擬持股 → 自選 → 選股結果）
   const currentOf = (sym: string): StockHealth | null => {
@@ -337,20 +398,53 @@ export default function WatchBoard() {
         </button>
       </div>
 
-      {/* 選股結果列：進度、買點檔數、篩選、回清單 */}
-      {inScan && (
-        <div className="mt-4 flex flex-wrap items-center gap-3 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.04] px-4 py-3">
-          <span className="text-sm text-white">
-            選股結果：掃 {scanProg.total} 檔（已依總分高→低排序）
-            {scanning ? `（進行中 ${scanProg.done}/${scanProg.total}）` : `，總分 ${HIGH}+ 共 ${buyCount} 檔`}
-          </span>
-          <div className="flex gap-1 text-xs">
-            <button onClick={() => setScanFilter('buy')} className={`rounded px-2 py-1 ${scanFilter === 'buy' ? 'bg-emerald-500/20 text-emerald-200' : 'text-slate-400 hover:text-white'}`}>只看總分 {HIGH}+</button>
-            <button onClick={() => setScanFilter('all')} className={`rounded px-2 py-1 ${scanFilter === 'all' ? 'bg-emerald-500/20 text-emerald-200' : 'text-slate-400 hover:text-white'}`}>全部</button>
+      {/* 選股結果列：進度、動作、分類篩選 */}
+      {inScan && (() => {
+        const addable = displayRows.filter((r) => !isErr(r) && !symbols.some((s) => s.toUpperCase() === r.symbol.toUpperCase())).map((r) => r.symbol)
+        const chipCls = (active: boolean) => `rounded px-2 py-1 text-xs ${active ? 'bg-emerald-500/20 text-emerald-200' : 'text-slate-400 hover:text-white'}`
+        return (
+        <div className="mt-4 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.04] px-4 py-3">
+          {/* 上排：標題 + 排序 + 動作 */}
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm text-white">
+              選股結果：掃 {scanProg.total} 檔（依{scanSort === 'gain' ? '本日漲幅' : '總分'}高→低）
+              {scanning && `（進行中 ${scanProg.done}/${scanProg.total}）`}
+            </span>
+            <div className="flex overflow-hidden rounded-md border border-white/10 text-xs">
+              <button onClick={() => setScanSort('score')} className={`px-2.5 py-1 ${scanSort === 'score' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'}`}>總分</button>
+              <button onClick={() => setScanSort('gain')} className={`px-2.5 py-1 ${scanSort === 'gain' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'}`}>本日漲幅</button>
+            </div>
+            {addable.length > 0 && (
+              <button onClick={() => addManyToWatch(addable)} className="ml-auto rounded-md border border-violet-400/40 bg-violet-500/10 px-3 py-1 text-xs font-medium text-violet-200 hover:bg-violet-500/20">
+                ＋ 全部加入追蹤（{addable.length}）
+              </button>
+            )}
+            <button onClick={() => setView('watch')} className={`text-xs text-slate-400 hover:text-white ${addable.length > 0 ? '' : 'ml-auto'}`}>← 回我的清單</button>
           </div>
-          <button onClick={() => setView('watch')} className="ml-auto text-xs text-slate-400 hover:text-white">← 回我的清單</button>
+          {/* 下排：大分類 → 中分類篩選（可複選，交集 AND）*/}
+          <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/5 pt-2.5">
+            <div className="flex items-center gap-1">
+              <span className="mr-0.5 text-[10px] text-slate-500">綜合</span>
+              <button onClick={() => toggleFilter('buy')} className={chipCls(filters.has('buy'))}>總分 {HIGH}+ {counts.buy}</button>
+              <button onClick={() => setFilters(new Set())} className={chipCls(filters.size === 0)}>全部</button>
+            </div>
+            {filterGroups.map((g) => (
+              <div key={g.cat} className="flex items-center gap-1">
+                <span className="mr-0.5 text-[10px] text-slate-500">{g.cat}</span>
+                {g.items.map((it) => (
+                  <button key={it.key} onClick={() => toggleFilter(it.key)} className={chipCls(filters.has(it.key))}>
+                    {it.label} {counts[it.key]}
+                  </button>
+                ))}
+              </div>
+            ))}
+            {filters.size > 0 && (
+              <button onClick={() => setFilters(new Set())} className="text-[11px] text-slate-500 hover:text-rose-300">清除（{filters.size}）✕</button>
+            )}
+          </div>
         </div>
-      )}
+        )
+      })()}
 
       {/* 我的模擬持股（假買，存本機，不是真下單） */}
       {!inScan && papers.length > 0 && (() => {
@@ -450,7 +544,7 @@ export default function WatchBoard() {
         </div>
       )}
 
-      <div className="mt-8 grid gap-4 sm:grid-cols-2">
+      <div className="mt-8 space-y-2.5">
         {displayRows.map((r) =>
           isErr(r) ? (
             !inScan && (
@@ -463,16 +557,16 @@ export default function WatchBoard() {
               </div>
             )
           ) : inScan ? (
-            <StockCard key={r.symbol} s={r} mode="scan" inWatch={symbols.includes(r.symbol)} onAdd={() => addToWatch(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} />
+            <StockCard key={r.symbol} s={r} mode="scan" inWatch={symbols.includes(r.symbol)} onAdd={() => addToWatch(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} bearish={market?.mood === 'bearish'} />
           ) : (
-            <StockCard key={r.symbol} s={r} mode="watch" onRemove={() => removeSymbol(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} />
+            <StockCard key={r.symbol} s={r} mode="watch" onRemove={() => removeSymbol(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} bearish={market?.mood === 'bearish'} />
           )
         )}
       </div>
 
       {inScan && !scanning && displayRows.length === 0 && (
         <p className="mt-8 text-sm text-slate-400">
-          這批熱門股裡，目前沒有總分 {HIGH} 以上的標的——這很正常，代表現在大環境或多數個股體質/技術/籌碼沒對齊。可切「全部」看完整清單（仍依總分排序），或改天再掃。
+          這批熱門股裡，目前沒有同時符合「{sel.length ? sel.map((k) => FILTER_LABELS[k]).join(' ＋ ') : '任何'}」的標的——這很正常，代表現在大環境或多數個股還沒對齊。可切「全部」看完整清單（仍依總分排序），或換個條件、改天再掃。
         </p>
       )}
 
@@ -523,56 +617,68 @@ function MarketBanner({ m }: { m: MarketOverview }) {
   )
 }
 
-function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld }: { s: StockHealth; mode: 'watch' | 'scan'; onRemove?: () => void; onAdd?: () => void; inWatch?: boolean; onPaperBuy?: () => void; isHeld?: boolean }) {
+function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld, bearish }: { s: StockHealth; mode: 'watch' | 'scan'; onRemove?: () => void; onAdd?: () => void; inWatch?: boolean; onPaperBuy?: () => void; isHeld?: boolean; bearish?: boolean }) {
+  const [open, setOpen] = useState(false) // 預設收合，點整列展開詳細
+  const [chartMode, setChartMode] = useState<'line' | 'candle'>('line') // 走勢圖：折線 / K棒
   const st = signalStyle[s.signal]
   const up = s.changePct >= 0
+  const sc = scoreColor(s.overallScore)
+  // 逆風降級：大盤偏空時，對偏多型進場訊號加註「寧可錯過」提醒
+  const bullishEntry = s.entry === '帶量突破' || s.entry === '接近買點' || s.entry === '強勢偏貴'
   return (
-    <div className={`rounded-xl border ${st.ring} bg-white/[0.03] p-5`}>
-      <div className="flex items-start justify-between">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className={`h-2.5 w-2.5 rounded-full ${st.dot} shrink-0`} />
-            <span className="font-semibold text-white truncate">{s.name}</span>
+    <div className={`rounded-xl border ${st.ring} bg-white/[0.03] overflow-hidden`}>
+      {/* ===== 精簡列（永遠顯示，點整列展開/收合）===== */}
+      <div onClick={() => setOpen((o) => !o)} className="cursor-pointer px-4 py-3 hover:bg-white/[0.02]">
+        <div className="flex items-center gap-2.5">
+          <span className={`h-2.5 w-2.5 rounded-full ${st.dot} shrink-0`} />
+          <div className="min-w-0 truncate">
+            <span className="font-semibold text-white">{s.name}</span>
+            <span className="ml-1.5 text-xs text-slate-500">{s.symbol}</span>
           </div>
-          <div className="mt-0.5 text-xs text-slate-500">{s.symbol}・{s.resolved}</div>
-        </div>
-        <div className="flex items-start gap-3 shrink-0">
-          <div className="text-right">
-            <div className="text-lg font-semibold text-white">{s.price}</div>
-            <div className={`text-sm ${up ? 'text-rose-400' : 'text-emerald-400'}`}>
-              {up ? '▲' : '▼'} {Math.abs(s.changePct)}%
+          <div className="ml-auto flex items-center gap-3 shrink-0">
+            <div className="text-right leading-tight">
+              <div className="text-sm font-semibold text-white">{s.price}</div>
+              <div className={`text-xs ${up ? 'text-rose-400' : 'text-emerald-400'}`}>{up ? '▲' : '▼'}{Math.abs(s.changePct)}%</div>
             </div>
+            <div className="flex items-baseline gap-0.5" title={`總分 ${s.overallScore}：${sc.label}`}>
+              <span className={`text-xl font-bold ${sc.text}`}>{s.overallScore}</span>
+              <span className="text-[10px] text-slate-500">分</span>
+            </div>
+            {mode === 'watch' ? (
+              <button onClick={(e) => { e.stopPropagation(); onRemove?.() }} className="text-slate-600 hover:text-rose-400 leading-none" aria-label={`移除 ${s.symbol}`}>×</button>
+            ) : inWatch ? (
+              <span className="text-xs text-emerald-400 whitespace-nowrap">✓已加入</span>
+            ) : (
+              <button onClick={(e) => { e.stopPropagation(); onAdd?.() }} className="rounded border border-violet-400/40 px-2 py-0.5 text-xs text-violet-200 hover:bg-violet-500/20 whitespace-nowrap">＋清單</button>
+            )}
+            <span className={`text-slate-500 transition-transform ${open ? 'rotate-180' : ''}`}>▾</span>
           </div>
-          {mode === 'watch' ? (
-            <button onClick={onRemove} className="text-slate-600 hover:text-rose-400 leading-none" aria-label={`移除 ${s.symbol}`}>×</button>
-          ) : inWatch ? (
-            <span className="text-xs text-emerald-400 whitespace-nowrap">✓ 已加入</span>
-          ) : (
-            <button onClick={onAdd} className="rounded border border-violet-400/40 px-2 py-0.5 text-xs text-violet-200 hover:bg-violet-500/20 whitespace-nowrap">＋清單</button>
-          )}
+        </div>
+        {/* 第二行：徽章 + 迷你走勢 */}
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 pl-5">
+          <span className={`rounded border px-2 py-0.5 text-[11px] font-medium ${entryStyle[s.entry].cls}`}>{s.entry}</span>
+          <span className={`rounded border px-2 py-0.5 text-[11px] font-medium ${fundStyle[s.fundSignal].cls}`}>{fundStyle[s.fundSignal].label}</span>
+          <span className={`rounded border px-2 py-0.5 text-[11px] font-medium ${volStyle[s.volLabel].cls}`} title={`日均 ±${s.volatilityPct}%`}>{s.volLabel}</span>
+          <span className={`rounded border px-2 py-0.5 text-[11px] font-medium ${chipStyle[s.chipSignal].cls}`}>{chipStyle[s.chipSignal].label}</span>
+          {s.chipBothBuy && <span className="rounded border border-fuchsia-500/50 bg-fuchsia-500/15 px-2 py-0.5 text-[11px] font-medium text-fuchsia-200">🔥同買</span>}
+          <Sparkline series={s.series} />
         </div>
       </div>
 
-      {/* ===== 總分（技術＋基本＋籌碼加權）===== */}
-      {(() => {
-        const sc = scoreColor(s.overallScore)
-        return (
-          <div className={`mt-4 rounded-lg border px-3 py-2.5 ${sc.ring}`}>
-            <div className="flex items-center gap-3">
-              <div className="flex items-baseline gap-1">
-                <span className={`text-2xl font-bold ${sc.text}`}>{s.overallScore}</span>
-                <span className="text-xs text-slate-500">/100</span>
-              </div>
-              <span className={`text-sm font-medium ${sc.text}`}>{sc.label}</span>
-              <div className="ml-auto flex gap-3 text-[11px] text-slate-400">
-                <span>技術 <span className="text-slate-200">{s.techScore}</span></span>
-                <span>基本 <span className="text-slate-200">{s.fundScore ?? '—'}</span></span>
-                <span>籌碼 <span className="text-slate-200">{s.chipScore ?? '—'}</span></span>
-              </div>
-            </div>
+      {/* ===== 展開：完整詳細 ===== */}
+      {open && (
+      <div className="border-t border-white/5 px-4 pb-4 pt-1">
+      {/* 三柱分數明細 */}
+      <div className={`mt-3 rounded-lg border px-3 py-2.5 ${sc.ring}`}>
+        <div className="flex items-center gap-3">
+          <span className={`text-sm font-medium ${sc.text}`}>{sc.label}</span>
+          <div className="ml-auto flex gap-3 text-[11px] text-slate-400">
+            <span>技術 <span className="text-slate-200">{s.techScore}</span></span>
+            <span>基本 <span className="text-slate-200">{s.fundScore ?? '—'}</span></span>
+            <span>籌碼 <span className="text-slate-200">{s.chipScore ?? '—'}</span></span>
           </div>
-        )
-      })()}
+        </div>
+      </div>
 
       {/* ===== 技術面（看時機）===== */}
       <section className="mt-3 rounded-lg border border-white/5 bg-white/[0.02] p-3">
@@ -580,6 +686,11 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld }: { 
           <span className="text-xs font-semibold text-slate-300">📈 技術面</span>
           <span className="text-[10px] text-slate-600">看進場時機</span>
         </div>
+        {bearish && bullishEntry && (
+          <div className="mb-2 rounded-md border border-sky-500/30 bg-sky-500/[0.08] px-2.5 py-1.5 text-[11px] leading-relaxed text-sky-200">
+            🌧 大盤逆風期：就算這檔偏多，做多也<span className="font-medium">部位減半、寧可錯過</span>——逆風時飆股訊號最容易變陷阱。
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <span className={`inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium ${entryStyle[s.entry].cls}`}>
             {s.entry}
@@ -590,6 +701,14 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld }: { 
           <span className={`inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium ${chipStyle[s.chipSignal].cls}`} title="領先指標：最近交易日三大法人買賣超">
             {chipStyle[s.chipSignal].label}
           </span>
+          <span className={`inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium ${volStyle[s.volLabel].cls}`} title={`波動度（${volStyle[s.volLabel].hint}）：近60日平均每日漲跌 ±${s.volatilityPct}%、3個月高低振幅約 ${s.range60Pct}%`}>
+            {s.volLabel}・日±{s.volatilityPct}%
+          </span>
+          {s.chipBothBuy && (
+            <span className="inline-flex items-center rounded-md border border-fuchsia-500/50 bg-fuchsia-500/15 px-2.5 py-1 text-xs font-medium text-fuchsia-200" title="外資與投信最近交易日同步買超：極強短線領先訊號">
+              🔥 外資投信同買
+            </span>
+          )}
         </div>
 
         {/* 籌碼面（領先）：外資/投信最近交易日買賣超（張） */}
@@ -605,10 +724,21 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld }: { 
           </div>
         )}
 
-        {/* 走勢圖：近約半年 收盤＋月線(20)＋季線(60)，線末直接標名稱 */}
-        <MiniChart series={s.series} />
+        {/* 走勢圖：可切換 折線（看趨勢）/ K棒（看進出場細節）*/}
+        <div className="mt-3 mb-1 flex items-center gap-2">
+          <span className="text-[11px] text-slate-500">走勢圖</span>
+          <div className="flex overflow-hidden rounded border border-white/10 text-[10px]">
+            {(['line', 'candle'] as const).map((m) => (
+              <button key={m} onClick={() => setChartMode(m)} className={`px-2 py-0.5 ${chartMode === m ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'}`}>
+                {m === 'line' ? '折線' : 'K棒'}
+              </button>
+            ))}
+          </div>
+          {chartMode === 'candle' && <span className="text-[10px] text-slate-500">近60根・紅漲綠跌</span>}
+        </div>
+        {chartMode === 'line' ? <MiniChart series={s.series} /> : <CandleChart series={s.series} />}
         <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400">
-          <span className="inline-flex items-center gap-1.5"><span className="inline-block w-4 rounded-full" style={{ height: 3, background: '#e2e8f0' }} />收盤價</span>
+          {chartMode === 'line' && <span className="inline-flex items-center gap-1.5"><span className="inline-block w-4 rounded-full" style={{ height: 3, background: '#e2e8f0' }} />收盤價</span>}
           <span className="inline-flex items-center gap-1.5"><span className="inline-block w-4 rounded-full" style={{ height: 2, background: '#fbbf24' }} />月線(20日)</span>
           <span className="inline-flex items-center gap-1.5"><span className="inline-block w-4 rounded-full" style={{ height: 2, background: '#818cf8' }} />季線(60日)</span>
         </div>
@@ -681,7 +811,26 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld }: { 
       >
         {isHeld ? '✓ 模擬持有中' : '📝 假買（記錄模擬買進）'}
       </button>
+      </div>
+      )}
     </div>
+  )
+}
+
+// 迷你走勢火花線：只畫收盤、無座標，給精簡列一眼看方向（紅漲綠跌，台股慣例）
+function Sparkline({ series }: { series: StockHealth['series'] }) {
+  const c = series.close
+  if (!c.length) return null
+  const W = 72, H = 22
+  const min = Math.min(...c), max = Math.max(...c)
+  const x = (i: number) => (c.length <= 1 ? 0 : (i / (c.length - 1)) * W)
+  const y = (v: number) => (1 - (v - min) / (max - min || 1)) * H
+  const d = c.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(' ')
+  const up = c[c.length - 1] >= c[0]
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="ml-auto h-5 w-16 shrink-0">
+      <path d={d} fill="none" stroke={up ? '#fb7185' : '#34d399'} strokeWidth="1.2" />
+    </svg>
   )
 }
 
@@ -693,11 +842,81 @@ function peColor(pe: number | null): string {
   return 'text-slate-200'
 }
 
+// 價格刻度：在 min~max 間取等距 count+1 條，回傳格線位置(viewBox y)與標籤縱向比例(frac)
+function priceTicks(min: number, max: number, H: number, padY: number, count = 4) {
+  const out: { price: number; yvb: number; frac: number }[] = []
+  for (let i = 0; i <= count; i++) {
+    const v = min + (i / count) * (max - min)
+    const yvb = padY + (1 - (v - min) / (max - min || 1)) * (H - 2 * padY)
+    out.push({ price: v, yvb, frac: yvb / H })
+  }
+  return out
+}
+// 刻度標籤（HTML 疊在圖右側留白；圖用 preserveAspectRatio=none 會扭曲文字，故文字走 HTML 不進 SVG）
+function PriceLabels({ ticks }: { ticks: { price: number; frac: number }[] }) {
+  const fmt = (v: number) => (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(1))
+  return (
+    <>
+      {ticks.map((t, i) => (
+        <span key={i} className="pointer-events-none absolute right-0 -translate-y-1/2 tabular-nums text-[9px] text-slate-500" style={{ top: `${t.frac * 100}%` }}>{fmt(t.price)}</span>
+      ))}
+    </>
+  )
+}
+
+// K 棒圖：近 60 根日K（紅漲綠跌＝台股慣例），疊月線/季線。小圖只畫 60 根才看得清楚 K 棒。
+function CandleChart({ series }: { series: StockHealth['series'] }) {
+  // 防呆：改版前抓到的舊資料沒有 OHLC，切 K 棒會 slice undefined 崩潰 → 提示重新整理
+  if (!series.open?.length || !series.high?.length || !series.low?.length) {
+    return <div className="mt-1 py-6 text-center text-[11px] text-slate-500">K 棒資料需重新整理（按清單上方「↻ 全部重新整理」即可）</div>
+  }
+  const N = Math.min(60, series.close.length)
+  const o = series.open.slice(-N), h = series.high.slice(-N), l = series.low.slice(-N), c = series.close.slice(-N)
+  const m20 = series.ma20.slice(-N), m60 = series.ma60.slice(-N)
+  const W = 320, H = 140, padR = 2, padY = 8
+  const nums = (a: (number | null)[]) => a.filter((v): v is number => v != null)
+  const all = [...h, ...l, ...nums(m20), ...nums(m60)]
+  if (!all.length) return null
+  const min = Math.min(...all), max = Math.max(...all)
+  const slot = (W - padR) / N
+  const cx = (i: number) => slot * (i + 0.5)
+  const y = (v: number) => padY + (1 - (v - min) / (max - min || 1)) * (H - 2 * padY)
+  const cw = Math.max(1.5, slot * 0.62)
+  const maPath = (arr: (number | null)[]) => {
+    let d = '', started = false
+    arr.forEach((v, i) => { if (v == null) return; d += `${started ? 'L' : 'M'}${cx(i).toFixed(1)} ${y(v).toFixed(1)} `; started = true })
+    return d.trim()
+  }
+  const mlines = [{ arr: m60, color: '#818cf8', label: '季60' }, { arr: m20, color: '#fbbf24', label: '月20' }]
+  const ticks = priceTicks(min, max, H, padY)
+  return (
+    <div className="relative mt-1 pr-9">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-44">
+        {ticks.map((t, i) => <line key={'g' + i} x1={0} y1={t.yvb} x2={W} y2={t.yvb} stroke="#ffffff" strokeOpacity={i === 0 || i === ticks.length - 1 ? 0.1 : 0.05} strokeWidth="0.5" vectorEffect="non-scaling-stroke" />)}
+        {mlines.map((ln) => <path key={ln.label} d={maPath(ln.arr)} fill="none" stroke={ln.color} strokeWidth="1" opacity="0.9" vectorEffect="non-scaling-stroke" />)}
+        {Array.from({ length: N }).map((_, i) => {
+          const up = c[i] >= o[i]
+          const color = up ? '#fb7185' : '#34d399'
+          const yo = y(o[i]), yc = y(c[i])
+          const top = Math.min(yo, yc), bot = Math.max(yo, yc)
+          return (
+            <g key={i}>
+              <line x1={cx(i)} y1={y(h[i])} x2={cx(i)} y2={y(l[i])} stroke={color} strokeWidth="1" vectorEffect="non-scaling-stroke" />
+              <rect x={cx(i) - cw / 2} y={top} width={cw} height={Math.max(0.8, bot - top)} fill={color} />
+            </g>
+          )
+        })}
+      </svg>
+      <PriceLabels ticks={ticks} />
+    </div>
+  )
+}
+
 function MiniChart({ series }: { series: StockHealth['series'] }) {
   const W = 320
   const H = 110
-  const padL = 4
-  const padR = 30 // 右側留白給線末標籤
+  const padL = 2
+  const padR = 2
   const padY = 8
   const nums = (a: (number | null)[]) => a.filter((v): v is number => v != null)
   const all = [...series.close, ...nums(series.ma20), ...nums(series.ma60)]
@@ -717,53 +936,52 @@ function MiniChart({ series }: { series: StockHealth['series'] }) {
     })
     return d.trim()
   }
-  const lastVal = (arr: (number | null)[]) => {
-    for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i] as number
-    return null
-  }
   const lines = [
     { arr: series.ma60, color: '#818cf8', label: '季60' },
     { arr: series.ma20, color: '#fbbf24', label: '月20' },
     { arr: series.close, color: '#e2e8f0', label: '收盤', w: 1.5 },
   ]
+  const ticks = priceTicks(min, max, H, padY)
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="mt-3 w-full h-28">
-      {lines.map((ln) => (
-        <path key={ln.label} d={path(ln.arr)} fill="none" stroke={ln.color} strokeWidth={ln.w ?? 1} />
-      ))}
-      {lines.map((ln) => {
-        const v = lastVal(ln.arr)
-        if (v == null) return null
-        return (
-          <text key={'t' + ln.label} x={W - padR + 3} y={y(v)} fill={ln.color} fontSize="8" dominantBaseline="middle">
-            {ln.label}
-          </text>
-        )
-      })}
-    </svg>
+    <div className="relative mt-3 pr-9">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-36">
+        {ticks.map((t, i) => (
+          <line key={'g' + i} x1={0} y1={t.yvb} x2={W} y2={t.yvb} stroke="#ffffff" strokeOpacity={i === 0 || i === ticks.length - 1 ? 0.1 : 0.05} strokeWidth="0.5" vectorEffect="non-scaling-stroke" />
+        ))}
+        {lines.map((ln) => (
+          <path key={ln.label} d={path(ln.arr)} fill="none" stroke={ln.color} strokeWidth={ln.w ?? 1} vectorEffect="non-scaling-stroke" />
+        ))}
+      </svg>
+      <PriceLabels ticks={ticks} />
+    </div>
   )
 }
 
 function KDChart({ series }: { series: StockHealth['series'] }) {
   const W = 320
   const H = 64
-  const padL = 4
-  const padR = 22 // 右側留白給 80/20 標籤
+  const padL = 2
+  const padR = 2
   const padY = 6
   const n = series.k.length
   if (!n) return null
   const x = (i: number) => padL + (n <= 1 ? 0 : (i / (n - 1)) * (W - padL - padR))
   const y = (v: number) => padY + (1 - v / 100) * (H - 2 * padY) // KD 固定 0~100
   const path = (arr: number[]) => arr.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(' ')
+  const kdTicks = [{ v: 80, c: '#f87171' }, { v: 50, c: '#64748b' }, { v: 20, c: '#34d399' }]
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="mt-1 w-full h-16">
-      <line x1={padL} y1={y(80)} x2={W - padR} y2={y(80)} stroke="#f87171" strokeWidth="0.5" strokeDasharray="3 3" opacity="0.6" />
-      <line x1={padL} y1={y(20)} x2={W - padR} y2={y(20)} stroke="#34d399" strokeWidth="0.5" strokeDasharray="3 3" opacity="0.6" />
-      <text x={W - padR + 2} y={y(80)} fill="#f87171" fontSize="7" dominantBaseline="middle">80</text>
-      <text x={W - padR + 2} y={y(20)} fill="#34d399" fontSize="7" dominantBaseline="middle">20</text>
-      <path d={path(series.d)} fill="none" stroke="#818cf8" strokeWidth="1" />
-      <path d={path(series.k)} fill="none" stroke="#fbbf24" strokeWidth="1" />
-    </svg>
+    <div className="relative mt-1 pr-6">
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-20">
+        <line x1={padL} y1={y(80)} x2={W - padR} y2={y(80)} stroke="#f87171" strokeWidth="0.5" strokeDasharray="3 3" opacity="0.6" vectorEffect="non-scaling-stroke" />
+        <line x1={padL} y1={y(50)} x2={W - padR} y2={y(50)} stroke="#64748b" strokeWidth="0.5" strokeDasharray="2 4" opacity="0.4" vectorEffect="non-scaling-stroke" />
+        <line x1={padL} y1={y(20)} x2={W - padR} y2={y(20)} stroke="#34d399" strokeWidth="0.5" strokeDasharray="3 3" opacity="0.6" vectorEffect="non-scaling-stroke" />
+        <path d={path(series.d)} fill="none" stroke="#818cf8" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+        <path d={path(series.k)} fill="none" stroke="#fbbf24" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+      </svg>
+      {kdTicks.map(({ v, c }) => (
+        <span key={v} className="pointer-events-none absolute right-0 -translate-y-1/2 text-[9px]" style={{ top: `${(y(v) / H) * 100}%`, color: c }}>{v}</span>
+      ))}
+    </div>
   )
 }
 

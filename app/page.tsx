@@ -2,6 +2,7 @@ import Link from 'next/link'
 
 const tools = [
   { href: '/watch', title: '自選股健檢', desc: '輸入台股代號，盤後日K自動算均線/KD/MACD，紅綠燈看多空', ready: true },
+  { href: '/lab', title: '選股研究室', desc: '預測對帳本：記下看好的股票，用「贏過大盤」驗證自己的判斷準不準', ready: true },
   { href: '/learn', title: '看盤技術課程懶人包', desc: '均線/KD/MACD/停損/估值/選股 SOP 重點整理，隨時複習', ready: true },
   { href: '/news', title: '新聞轉發控制台', desc: '看候選新聞、改草稿、直接發 Threads 或複製自己發', ready: true },
   { href: '/haixun', title: 'Threads 海巡控制台', desc: '審核候選、編輯草稿、一鍵核准發送', ready: true },
