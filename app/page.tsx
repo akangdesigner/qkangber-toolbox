@@ -2,12 +2,10 @@ import Link from 'next/link'
 
 const tools = [
   { href: '/watch', title: '自選股健檢', desc: '輸入台股代號，盤後日K自動算均線/KD/MACD，紅綠燈看多空', ready: true },
-  { href: '/lab', title: '選股研究室', desc: '預測對帳本：記下看好的股票，用「贏過大盤」驗證自己的判斷準不準', ready: true },
-  { href: '/learn', title: '看盤技術課程懶人包', desc: '均線/KD/MACD/停損/估值/選股 SOP 重點整理，隨時複習', ready: true },
   { href: '/news', title: '新聞轉發控制台', desc: '看候選新聞、改草稿、直接發 Threads 或複製自己發', ready: true },
-  { href: '/haixun', title: 'Threads 海巡控制台', desc: '審核候選、編輯草稿、一鍵核准發送', ready: true },
-  { href: '/tools/html-editor', title: 'HTML 文章編輯器', desc: '草稿轉圖床、一鍵發布到 Google Sheets', ready: true },
   { href: '/tools/social-post', title: '社群貼文產生器', desc: '長文拆成主貼文＋第一則留言', ready: true },
+  { href: '/tools/idea-spark', title: '創業靈感雷達', desc: '抓 Hacker News 的 Show HN，AI 翻中文＋補延伸靈感', ready: true },
+  { href: '/tools/memory-bot', title: '思念機器人', desc: '匯入真實 LINE 對話，跟「像那個人」的 AI 聊天（v0）', ready: true },
 ]
 
 export default function Dashboard() {
