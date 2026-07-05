@@ -37,6 +37,8 @@ export type StockHealth = {
   volatilityPct: number // 近60日「平均每日漲跌幅絕對值」%，越大越會跳
   range60Pct: number // 近60日收盤高低振幅 %（最高比最低高多少）
   volLabel: '低波' | '中波' | '高波' // 波動分級：日均<1.5%低、1.5~3%中、>3%高
+  stopPct: number // 建議停損距離 %（3.5×日均波動，夾 5~15；回測近2年：固定-6%停損連隨機進場都有約48%機率被雜訊掃出場，停損距離必須隨波動放大）
+  stopPrice: number // 建議停損價 = 現價 ×(1 − stopPct/100)，進場前先寫下來
   verdict: string // 一句話結論（技術面）
   // ---- 基本盤（體質）判定：成長(月營收YoY) + 估值(PE/PB/殖利率) ----
   revYoY: number | null // 單月營收年增率 %（最新公布月份；ETF/無資料為 null）
@@ -389,20 +391,24 @@ function scoreTechnical(s: Pick<StockHealth, 'aboveMa60' | 'arrange' | 'macdHist
 }
 
 // 籌碼面分數 0~100：當日買賣超方向＋投信權重＋連買/連賣天數
-function scoreChip(chip: Chip): number | null {
+// 方向分數依「買賣超佔當日成交量比重」加權：買超 300 張對日成交上萬張的股票是雜訊，
+// 不該拿到跟大買 5% 成交量一樣的分數（≥2% 全額、0.5~2% 減半、<0.5% 幾乎不計）
+function scoreChip(chip: Chip, dayVolLots: number | null): number | null {
   if (chip.total == null) return null
+  const sig = dayVolLots && dayVolLots > 0 ? Math.abs(chip.total) / dayVolLots : null
+  const w = sig == null ? 1 : sig >= 0.02 ? 1 : sig >= 0.005 ? 0.5 : 0.15
   let c = 50
-  c += chip.total > 0 ? 10 : chip.total < 0 ? -10 : 0
+  c += (chip.total > 0 ? 10 : chip.total < 0 ? -10 : 0) * w
   const t = chip.trust ?? 0, f = chip.foreign ?? 0
-  c += t > 0 ? 8 : t < 0 ? -4 : 0 // 投信買超權重高
-  c += f > 0 ? 5 : f < 0 ? -5 : 0
-  if (f > 0 && t > 0) c += 6 // 外資投信同買：綜效加分（極強領先）
+  c += (t > 0 ? 8 : t < 0 ? -4 : 0) * w // 投信買超權重高
+  c += (f > 0 ? 5 : f < 0 ? -5 : 0) * w
+  if (f > 0 && t > 0) c += 6 * w // 外資投信同買：綜效加分（極強領先）
   if (chip.trustStreak >= 3) c += 8
   else if (chip.trustStreak >= 2) c += 4
   else if (chip.trustStreak <= -3) c -= 6
   if (chip.foreignStreak >= 3) c += 5
   else if (chip.foreignStreak <= -3) c -= 5
-  return Math.max(0, Math.min(100, c))
+  return Math.round(Math.max(0, Math.min(100, c)))
 }
 
 // 總分：技術 0.4 / 基本 0.4 / 籌碼 0.2，只對有資料的柱子加權正規化
@@ -514,7 +520,6 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
   const fund = judgeFundamental(rev, val.pe, val.pb, val.yield)
   const chip: Chip = chipMap[bareCode] || { foreign: null, trust: null, total: null, date: null, foreignStreak: 0, trustStreak: 0 }
   const chipJudge = judgeChip(chip)
-  const chipScoreVal = scoreChip(chip)
   const revMomentum = rev.yoy != null && rev.yoyCum != null ? Math.round((rev.yoy - rev.yoyCum) * 10) / 10 : null
 
   const closes = candles.map((c) => c.close)
@@ -581,6 +586,13 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
   const range60Pct = rLo > 0 ? round(((rHi - rLo) / rLo) * 100, 0) : 0
   const volLabel: StockHealth['volLabel'] = volatilityPct >= 3 ? '高波' : volatilityPct >= 1.5 ? '中波' : '低波'
 
+  // 建議停損：距離隨波動放大（回測近2年：固定 -6% 連隨機進場都有 ~48% 機率被日常雜訊掃出場）
+  const stopPct = round(Math.min(15, Math.max(5, 3.5 * volatilityPct)), 1)
+  const stopPrice = round(price * (1 - stopPct / 100))
+
+  // 籌碼分數要用「佔成交量比重」加權，所以在量能算完後才評分
+  const chipScoreVal = scoreChip(chip, isFinite(volNow) ? volNow / 1000 : null)
+
   // 畫圖序列：最近約 120 個交易日的收盤＋月線(20)＋季線(60)
   const N = Math.min(120, candles.length)
   const start = candles.length - N
@@ -623,6 +635,14 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
   else if (arrange === '糾結盤整' && breakout) entry = '帶量突破'
   else entry = '盤整觀望'
 
+  // 大漲日追高警語（回測近2年：單日漲逾6%後追進，約五成機率20日內先回落6%以上——
+  // 動能單常「先洗再噴」，不是不能做，是部位要小、停損要用波動化的建議價，新手最常死在這裡）
+  const chgToday = round(((price - prevClose) / prevClose) * 100, 2)
+  let verdictFinal = verdict
+  if (chgToday >= 6) {
+    verdictFinal += `⚠️ 今日已大漲 ${chgToday}%，隔日追進約五成機率先回落 6% 以上再說（回測統計）——要進場請縮小部位，停損放在建議價 ${stopPrice}（-${stopPct}%）。`
+  }
+
   // 綜合評分：技術（含量價）+ 基本 + 籌碼
   const techScore = Math.max(0, Math.min(100, scoreTechnical({ aboveMa60, arrange, macdHist: m.hist, kdCross, kdZone, entry }) + volAdj))
   const overall = scoreOverall(techScore, fund.score, chipScoreVal)
@@ -633,7 +653,7 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     name: cnName || meta.shortName || meta.longName || resolved,
     price: round(price),
     prevClose: round(prevClose),
-    changePct: round(((price - prevClose) / prevClose) * 100, 2),
+    changePct: chgToday,
     ma5: round(ma5),
     ma20: round(ma20),
     ma60: round(ma60),
@@ -659,7 +679,9 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     volatilityPct,
     range60Pct,
     volLabel,
-    verdict,
+    stopPct,
+    stopPrice,
+    verdict: verdictFinal,
     revYoY: rev.yoy,
     revYoYCum: rev.yoyCum,
     revMonth: rev.month,
@@ -738,7 +760,12 @@ export async function getMarketOverview(): Promise<MarketOverview> {
     const p = twii.changePct
     pts += p >= 1.5 ? 2 : p > 0.3 ? 1 : p >= -0.3 ? 0 : p > -1.5 ? -1.5 : p > -3 ? -2.5 : -3.5
   }
-  if (sox) pts += sox.changePct > 0 ? 1.5 : -1.5 // 費半對台股電子最關鍵（反映昨晚美股）
+  // 費半對台股電子最關鍵，且要看「幅度」不能只看紅黑（回測近2年：費半跌0~1.5%→電子隔日平均+0.1%；
+  // 跌1.5~3%→平均-1.2%、76%收黑；跌逾3%→平均-2.2%、85%收黑，劑量效應非常明確）
+  if (sox) {
+    const sp = sox.changePct
+    pts += sp > 0 ? 1.5 : sp > -1.5 ? -1 : sp > -3 ? -2.5 : -3.5
+  }
   if (gspc) pts += gspc.changePct > 0 ? 0.5 : -0.5
   if (vix) {
     pts += vix.price < 16 ? 1 : vix.price > 25 ? -1.5 : 0 // 絕對水位
@@ -749,6 +776,8 @@ export async function getMarketOverview(): Promise<MarketOverview> {
   const dayDrop = twii ? twii.changePct : 0
   if (dayDrop <= -2 && mood === 'bullish') mood = 'neutral'
   if (dayDrop <= -3) mood = 'bearish'
+  // 費半重挫日也不准喊順風（電子占台股權重太高，隔日 85% 機率電子收黑）
+  if (sox && sox.changePct <= -3 && mood === 'bullish') mood = 'neutral'
   const moodLabel = mood === 'bullish' ? '環境偏多' : mood === 'bearish' ? '環境偏空' : '環境中性'
   const reasons: string[] = []
   if (twii) {
@@ -756,7 +785,11 @@ export async function getMarketOverview(): Promise<MarketOverview> {
     if (dayDrop <= -2) reasons.push(`加權今日重挫 ${Math.abs(twii.changePct)}%`)
     else if (twii.changePct >= 2) reasons.push(`加權今日大漲 ${twii.changePct}%`)
   }
-  if (sox) reasons.push(sox.changePct >= 0 ? '費半收紅' : '費半收黑')
+  if (sox) {
+    if (sox.changePct <= -3) reasons.push(`費半重挫 ${Math.abs(sox.changePct)}%——⚠️ 電子股今日避開（歷史上費半跌逾3%後，台股電子隔日 85% 收黑、平均 -2.2%）`)
+    else if (sox.changePct <= -1.5) reasons.push(`費半大跌 ${Math.abs(sox.changePct)}%，電子股保守`)
+    else reasons.push(sox.changePct >= 0 ? '費半收紅' : '費半收黑')
+  }
   if (vix) reasons.push(vix.changePct >= 7 ? `VIX 跳升 ${vix.changePct}%` : vix.price < 16 ? 'VIX 平靜' : vix.price > 25 ? 'VIX 偏高' : 'VIX 中性')
   const moodText =
     (mood === 'bullish' ? '大環境順風，操作可積極些；' : mood === 'bearish' ? '大環境逆風，做多保守、控制部位、今天別追高；' : '大環境中性，個股表現為主，盤勢震盪別追高；') +

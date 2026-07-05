@@ -12,7 +12,7 @@ const BUDGET_KEY = 'qk-paperbudget'
 const DEFAULT_BUDGET = 5000 // 模擬持股每檔預設投入金額（用來回推零股股數）
 const DEFAULT_LIST = ['2330', '0050', '2412']
 
-type PaperPos = { symbol: string; name: string; entryPrice: number; entryDate: string }
+type PaperPos = { symbol: string; name: string; entryPrice: number; entryDate: string; stopPrice?: number } // stopPrice：買進當下記的停損價（舊資料沒有此欄）
 
 // 台股 AI 概念股快速名單（晶片/設計、AI 伺服器、散熱電源、管理晶片）
 const AI_STOCKS = ['2330', '2454', '3661', '3035', '2317', '2382', '3231', '6669', '2376', '3017', '2308', '5274']
@@ -148,10 +148,10 @@ export default function WatchBoard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // 假買：用現價記一筆模擬買進（存本機，不是真下單）
+  // 假買：用現價記一筆模擬買進（存本機，不是真下單）。停損價一起記下——買進當下就定好出場，才是紀律
   function paperBuy(s: StockHealth) {
     if (papers.some((p) => p.symbol === s.symbol)) return
-    const next = [{ symbol: s.symbol, name: s.name, entryPrice: s.price, entryDate: new Date().toISOString() }, ...papers]
+    const next = [{ symbol: s.symbol, name: s.name, entryPrice: s.price, entryDate: new Date().toISOString(), stopPrice: s.stopPrice }, ...papers]
     setPapers(next)
     localStorage.setItem(PAPER_KEY, JSON.stringify(next))
     setPaperData((prev) => [s, ...prev.filter((r) => r.symbol !== s.symbol)])
@@ -511,6 +511,11 @@ export default function WatchBoard() {
                       </span>
                     )}
                     <span className="text-xs text-slate-500">持有 {days} 天</span>
+                    {p.stopPrice != null && curPrice != null && (
+                      curPrice <= p.stopPrice
+                        ? <span className="rounded border border-rose-500/50 bg-rose-500/15 px-2 py-0.5 text-xs font-semibold text-rose-300">🛑 已觸停損 {p.stopPrice}——照紀律出場，不凹單</span>
+                        : <span className="text-xs text-slate-500">停損 {p.stopPrice}</span>
+                    )}
                     {cur && !cur.aboveMa60 && <span className="text-xs text-amber-400">⚠ 已跌破季線，考慮出場</span>}
                     {cur && cur.kdCross === '死亡交叉' && <span className="text-xs text-amber-400">⚠ KD 死亡交叉</span>}
                     <button onClick={() => paperSell(p.symbol)} className="ml-auto rounded border border-white/10 px-2 py-0.5 text-xs text-slate-300 hover:border-rose-400/50 hover:text-rose-300">賣出平倉</button>
@@ -703,6 +708,9 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld, bear
           </span>
           <span className={`inline-flex items-center rounded-md border px-2.5 py-1 text-xs font-medium ${volStyle[s.volLabel].cls}`} title={`波動度（${volStyle[s.volLabel].hint}）：近60日平均每日漲跌 ±${s.volatilityPct}%、3個月高低振幅約 ${s.range60Pct}%`}>
             {s.volLabel}・日±{s.volatilityPct}%
+          </span>
+          <span className="inline-flex items-center rounded-md border border-rose-500/30 bg-rose-500/[0.06] px-2.5 py-1 text-xs font-medium text-rose-200" title={`停損距離依這檔的波動度推算（3.5×日均波動，夾5~15%）。回測：固定-6%停損有近半機率被日常雜訊掃出場，波動大的股票停損要放得更遠、部位相應縮小`}>
+            🛑 建議停損 {s.stopPrice}（-{s.stopPct}%）
           </span>
           {s.chipBothBuy && (
             <span className="inline-flex items-center rounded-md border border-fuchsia-500/50 bg-fuchsia-500/15 px-2.5 py-1 text-xs font-medium text-fuchsia-200" title="外資與投信最近交易日同步買超：極強短線領先訊號">
