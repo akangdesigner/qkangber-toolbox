@@ -8,3 +8,6 @@
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store
+
+# 思念機器人：使用者私密對話資料，絕不進版控
+/data/memory-bot
