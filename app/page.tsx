@@ -7,6 +7,7 @@ const tools = [
   { href: '/tools/idea-spark', title: '創業靈感雷達', desc: '時事點子庫（n8n 每天掃民生新聞評工具化/商機）＋Show HN 靈感', ready: true },
   { href: '/tools/memory-bot', title: '思念機器人', desc: '匯入真實 LINE 對話，跟「像那個人」的 AI 聊天（v0）', ready: true },
   { href: '/tools/werewolf', title: '狼人殺筆記', desc: '錄音自動轉逐字稿，AI 判狼＋賽後復盤，教訓越存越準', ready: true },
+  { href: '/tools/meme-post', title: '梗圖配文控制台', desc: '挑梗圖，AI 看圖找出最搭的官網文章/新聞，寫好草稿發 Threads', ready: true },
 ]
 
 export default function Dashboard() {
