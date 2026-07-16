@@ -167,38 +167,46 @@ export async function transcribeWithTone(file: File): Promise<string> {
   return text
 }
 
-// ---- 跳身分自動偵測：從新轉錄的發言段落抓「誰跳了什麼」 ----
+// ---- 即時筆記：每段逐字稿進來，AI 萃取所有有用的對局資訊 ----
 
-const EXTRACT_SYSTEM = `你從狼人殺發言片段中偵測「跳身分」事件。所有輸出一律使用繁體中文。
+const NOTES_SYSTEM = `你是狼人殺場邊記錄員。每收到一段新發言，就萃取「對判狼有用的資訊」記成筆記。所有輸出一律使用繁體中文。
 
-跳身分 = 玩家明確聲稱自己的身分，例如：
-- 「我是預言家，昨晚驗了…」→ 跳預言家
-- 「我女巫，昨晚救的是…」→ 跳女巫
-- 「我就一個平民」→ 認平民
-- 別人轉述也算：「2號也跳了預言家」→ 2號跳預言家
-- 「我退水」= 退出警長競選，不是跳身分，忽略
-- 質疑、猜測不算：「你根本不是預言家」「我覺得他是狼」都不是跳身分
+值得記的（有用資訊都算）：
+- 跳身分／認身分：「2號跳預言家，報4號查殺」
+- 質疑與指控：「3號質疑2號跳得太急」
+- 站邊與包庇：「5號無條件幫7號說話」
+- 前後矛盾：「9號先說沒想法，後又堅定投4號」
+- 投票意向、退水、警徽流宣告
+- 明顯的情緒異常（逐字稿的語氣標註）：「6號被點名後明顯遲疑」
 
-只輸出 JSON：{"claims":[{"seat":"座位標籤（必須完全符合提供的座位列表）","claim":"跳預言家/跳女巫/認平民…"}]}
-沒有偵測到就回 {"claims":[]}。寧缺勿濫，不確定就不要輸出。`
+規則：
+- 每條筆記一句話，以座位號開頭，具體、中性、不下結論（判狼是別人的事）
+- 只記「新資訊」——已有筆記裡寫過的不要重複
+- 寒暄、過場、無資訊量的話不記
+- 沒有新資訊就回空陣列，寧缺勿濫
 
-export async function extractClaims(payload: {
+只輸出 JSON：{"notes":["...","..."]}`
+
+export async function takeNotes(payload: {
   segment: string
   seats: { id: string; player?: string }[]
-}): Promise<{ seat: string; claim: string }[]> {
-  const { segment, seats } = payload
+  existingNotes: string[]
+}): Promise<string[]> {
+  const { segment, seats, existingNotes } = payload
   const seatIds = seats.map((s) => s.id)
   const user = `座位列表：${seatIds.join('、')}
-${seats.some((s) => s.player) ? `座位對應玩家：${seats.filter((s) => s.player).map((s) => `${s.id}=${s.player}`).join('、')}（發言若用名字稱呼，對應回座位）` : ''}
+${seats.some((s) => s.player) ? `座位對應玩家：${seats.filter((s) => s.player).map((s) => `${s.id}=${s.player}`).join('、')}（發言若用名字稱呼，換算回座位號記錄）` : ''}
 
-發言片段：
+已有筆記（不要重複記）：
+${existingNotes.length ? existingNotes.slice(-30).map((n, i) => `${i + 1}. ${n}`).join('\n') : '（還沒有）'}
+
+新發言片段：
 ${segment}
 
-偵測跳身分，只回傳 JSON。`
-  const raw = await chatJSON(EXTRACT_SYSTEM, user, 400, 0)
-  const parsed = JSON.parse(raw) as { claims?: { seat: string; claim: string }[] }
-  // 只留座位合法的結果
-  return (parsed.claims ?? []).filter((c) => seatIds.includes(c.seat) && c.claim)
+萃取新筆記，只回傳 JSON。`
+  const raw = await chatJSON(NOTES_SYSTEM, user, 800, 0.2)
+  const parsed = JSON.parse(raw) as { notes?: string[] }
+  return (parsed.notes ?? []).filter((n) => typeof n === 'string' && n.trim())
 }
 
 // ---- 判狼 ----
@@ -249,8 +257,9 @@ export async function judge(payload: {
   transcript: string
   lessons: Lesson[]
   events?: string[]
+  notes?: string[]
 }): Promise<Judgement> {
-  const { board, transcript, lessons, events = [] } = payload
+  const { board, transcript, lessons, events = [], notes = [] } = payload
 
   const seatList = board.seats
     .map((s) => {
@@ -289,6 +298,9 @@ ${myInfo}
 
 【戰況記錄（使用者實時回報：出局、票型、警長歸屬、警上警下陣容等，按時間順序）】
 ${eventsBlock}
+
+【場邊即時筆記（AI 逐段整理的觀察，按時間順序）】
+${notes.length ? notes.map((n, i) => `${i + 1}. ${n}`).join('\n') : '（無）'}
 
 【過往教訓（先驗知識，優先納入）】
 ${lessonsBlock(lessons)}

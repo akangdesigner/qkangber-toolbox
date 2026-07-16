@@ -26,6 +26,7 @@ type Game = {
   board: Board
   transcript: string
   events?: string[]
+  notes?: string[]
   judgement: Judgement | null
   truth: Truth[] | null
   result?: string
@@ -110,6 +111,8 @@ export default function WerewolfPage() {
   const [transcript, setTranscript] = useState('')
   const [events, setEvents] = useState<string[]>([]) // 戰況記錄：出局/票型/警長…
   const [eventInput, setEventInput] = useState('')
+  const [notes, setNotes] = useState<string[]>([]) // AI 場邊筆記（逐段自動萃取）
+  const notesRef = useRef<string[]>([])
   const [judgement, setJudgement] = useState<Judgement | null>(null)
   const [gameId, setGameId] = useState<string>(uid)
 
@@ -161,6 +164,8 @@ export default function WerewolfPage() {
       setBoard(cur.board)
       setTranscript(cur.transcript ?? '')
       setEvents(cur.events ?? [])
+      setNotes(cur.notes ?? [])
+      notesRef.current = cur.notes ?? []
       setJudgement(cur.judgement ?? null)
       setGameId(cur.id ?? uid())
       setPhase(cur.phase ?? 'setup')
@@ -169,8 +174,8 @@ export default function WerewolfPage() {
 
   // ---- 自動存本局進度 ----
   useEffect(() => {
-    save(LS.current, { id: gameId, board, transcript, events, judgement, phase })
-  }, [gameId, board, transcript, events, judgement, phase])
+    save(LS.current, { id: gameId, board, transcript, events, notes, judgement, phase })
+  }, [gameId, board, transcript, events, notes, judgement, phase])
 
   // ---- 「阿康之神」指派到哪格，那格就是我的座位 ----
   useEffect(() => {
@@ -283,7 +288,7 @@ export default function WerewolfPage() {
         // 有指定發言者 → 自動掛名
         const entry = segSpeaker ? `${segSpeaker}：${text}` : text
         setTranscript((t) => (t ? t + '\n' + entry : entry))
-        void autoDetectClaims(entry) // 背景偵測跳身分，不擋轉錄
+        void autoTakeNotes(entry) // AI 背景做筆記，不擋轉錄
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : '轉錄失敗')
@@ -292,28 +297,26 @@ export default function WerewolfPage() {
     }
   }
 
-  // 跳身分自動偵測：轉錄完一段就掃一遍「誰跳了什麼」，自動填進場上狀態。
-  // 靜默失敗（偵測只是輔助，不要跳錯誤打斷對局）；手動修改隨時可以覆蓋。
-  async function autoDetectClaims(segment: string) {
+  // AI 場邊筆記：轉錄完一段就萃取所有有用資訊（跳身分、質疑、站邊、矛盾…）。
+  // 靜默失敗（筆記只是輔助，不要跳錯誤打斷對局）；筆記可手動刪。
+  async function autoTakeNotes(segment: string) {
     try {
       const res = await fetch('/api/tools/werewolf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action: 'extract',
+          action: 'notes',
           segment,
           seats: board.seats.map((s) => ({ id: s.id, player: s.player })),
+          existingNotes: notesRef.current,
         }),
       })
       const json = await res.json()
-      if (!res.ok || !Array.isArray(json.claims) || json.claims.length === 0) return
-      const claimMap = new Map<string, string>(json.claims.map((c: { seat: string; claim: string }) => [c.seat, c.claim]))
-      setBoard((b) => ({
-        ...b,
-        seats: b.seats.map((s) => (claimMap.has(s.id) ? { ...s, claim: claimMap.get(s.id) } : s)),
-      }))
+      if (!res.ok || !Array.isArray(json.notes) || json.notes.length === 0) return
+      notesRef.current = [...notesRef.current, ...json.notes]
+      setNotes(notesRef.current)
     } catch {
-      // 靜默：偵測失敗不影響主流程
+      // 靜默：筆記失敗不影響主流程
     }
   }
 
@@ -340,6 +343,7 @@ export default function WerewolfPage() {
           board,
           transcript,
           events,
+          notes,
           lessons: lessons.map((l) => ({ title: l.title, insight: l.insight })),
         }),
       })
@@ -433,6 +437,7 @@ export default function WerewolfPage() {
         board,
         transcript,
         events,
+        notes,
         judgement,
         truth: filledTruth,
         result: resultText,
@@ -455,6 +460,8 @@ export default function WerewolfPage() {
     setTranscript('')
     setEvents([])
     setEventInput('')
+    setNotes([])
+    notesRef.current = []
     setJudgement(null)
     setTruth([])
     setResultText('')
@@ -803,43 +810,60 @@ export default function WerewolfPage() {
                 </div>
               </section>
 
-              {/* 場上狀態：跳身分 + 出局 */}
+              {/* 場上狀態：出局標記 */}
               <section className="rounded-2xl p-4" style={cardStyle}>
                 <div className="flex items-center justify-between mb-2">
                   <h2 className="text-white font-medium">場上狀態</h2>
                   <span className="text-xs text-slate-500">存活 {aliveCount}/{board.players}</span>
                 </div>
-                <p className="text-xs text-slate-500 mb-3">有人跳身分就登記（例：跳預言家、認女巫）；出局點 💀</p>
-                <div className="space-y-1.5">
+                <p className="text-xs text-slate-500 mb-3">出局點一下座位（再點復活）</p>
+                <div className="flex flex-wrap gap-1.5">
                   {board.seats.map((s, i) => (
-                    <div key={s.id} className="flex gap-2 items-center">
-                      <span
-                        className={`w-20 text-sm shrink-0 ${s.out ? 'text-slate-600 line-through' : board.mySeat === s.id ? 'text-violet-300' : 'text-white'}`}
-                      >
-                        {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
-                      </span>
-                      <input
-                        value={s.claim ?? ''}
-                        onChange={(e) => setSeat(i, { claim: e.target.value })}
-                        placeholder="跳身分"
-                        className="flex-1 min-w-0 rounded-lg px-3 py-1.5 text-white text-sm placeholder-slate-700 focus:outline-none"
-                        style={inputStyle}
-                      />
-                      <button
-                        onClick={() => setSeat(i, { out: !s.out })}
-                        className="px-2.5 py-1.5 rounded-lg text-sm shrink-0"
-                        style={
-                          s.out
-                            ? { background: 'rgba(239,68,68,0.12)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)' }
-                            : { ...inputStyle, color: '#64748b' }
-                        }
-                        title={s.out ? '已出局（點擊復活）' : '標記出局'}
-                      >
-                        💀
-                      </button>
-                    </div>
+                    <button
+                      key={s.id}
+                      onClick={() => setSeat(i, { out: !s.out })}
+                      className="px-3 py-1.5 rounded-full text-xs font-medium"
+                      style={
+                        s.out
+                          ? { background: 'rgba(239,68,68,0.12)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)', textDecoration: 'line-through' }
+                          : { ...inputStyle, color: board.mySeat === s.id ? '#c4b5fd' : '#94a3b8' }
+                      }
+                    >
+                      {s.out ? '💀' : ''}{s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
+                    </button>
                   ))}
                 </div>
+              </section>
+
+              {/* AI 場邊筆記 */}
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="text-white font-medium">🗒 AI 場邊筆記</h2>
+                  <span className="text-xs text-slate-500">{notes.length} 條</span>
+                </div>
+                <p className="text-xs text-slate-500 mb-3">
+                  每段發言轉錄完 AI 自動記：跳身分、查殺宣稱、質疑、站邊、矛盾…判狼時全部帶入。記錯可刪。
+                </p>
+                {notes.length === 0 ? (
+                  <p className="text-sm text-slate-600">開始錄音後筆記會自動長出來。</p>
+                ) : (
+                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                    {notes.map((n, i) => (
+                      <div key={i} className="flex items-start gap-2 rounded-lg px-3 py-1.5 text-sm" style={inputStyle}>
+                        <span className="flex-1 text-slate-300">{n}</span>
+                        <button
+                          onClick={() => {
+                            notesRef.current = notesRef.current.filter((_, idx) => idx !== i)
+                            setNotes(notesRef.current)
+                          }}
+                          className="text-xs text-slate-600 hover:text-red-400 shrink-0"
+                        >
+                          刪
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </section>
 
               {/* 逐字稿 */}

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { transcribeAudio, transcribeWithTone, judge, reflect, extractClaims } from '@/lib/werewolf'
+import { transcribeAudio, transcribeWithTone, judge, reflect, takeNotes } from '@/lib/werewolf'
 
 // 狼人殺筆記後端：無狀態，只做三件 AI 事。金鑰留在 .env（GROQ_API_KEY）。
 // - action=transcribe：multipart form-data，欄位 audio（音檔）→ 回逐字稿
@@ -43,17 +43,22 @@ export async function POST(request: Request) {
         transcript: body.transcript,
         lessons: Array.isArray(body.lessons) ? body.lessons : [],
         events: Array.isArray(body.events) ? body.events : [],
+        notes: Array.isArray(body.notes) ? body.notes : [],
       })
       return NextResponse.json({ success: true, judgement: result })
     }
 
-    if (action === 'extract') {
-      // 從新轉錄段落自動偵測跳身分
+    if (action === 'notes') {
+      // 即時筆記：從新轉錄段落萃取所有有用資訊
       if (!body.segment || !Array.isArray(body.seats)) {
         return NextResponse.json({ error: '缺少發言片段或座位' }, { status: 400 })
       }
-      const claims = await extractClaims({ segment: body.segment, seats: body.seats })
-      return NextResponse.json({ success: true, claims })
+      const notes = await takeNotes({
+        segment: body.segment,
+        seats: body.seats,
+        existingNotes: Array.isArray(body.existingNotes) ? body.existingNotes : [],
+      })
+      return NextResponse.json({ success: true, notes })
     }
 
     if (action === 'reflect') {
