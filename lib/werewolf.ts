@@ -167,6 +167,40 @@ export async function transcribeWithTone(file: File): Promise<string> {
   return text
 }
 
+// ---- 跳身分自動偵測：從新轉錄的發言段落抓「誰跳了什麼」 ----
+
+const EXTRACT_SYSTEM = `你從狼人殺發言片段中偵測「跳身分」事件。所有輸出一律使用繁體中文。
+
+跳身分 = 玩家明確聲稱自己的身分，例如：
+- 「我是預言家，昨晚驗了…」→ 跳預言家
+- 「我女巫，昨晚救的是…」→ 跳女巫
+- 「我就一個平民」→ 認平民
+- 別人轉述也算：「2號也跳了預言家」→ 2號跳預言家
+- 「我退水」= 退出警長競選，不是跳身分，忽略
+- 質疑、猜測不算：「你根本不是預言家」「我覺得他是狼」都不是跳身分
+
+只輸出 JSON：{"claims":[{"seat":"座位標籤（必須完全符合提供的座位列表）","claim":"跳預言家/跳女巫/認平民…"}]}
+沒有偵測到就回 {"claims":[]}。寧缺勿濫，不確定就不要輸出。`
+
+export async function extractClaims(payload: {
+  segment: string
+  seats: { id: string; player?: string }[]
+}): Promise<{ seat: string; claim: string }[]> {
+  const { segment, seats } = payload
+  const seatIds = seats.map((s) => s.id)
+  const user = `座位列表：${seatIds.join('、')}
+${seats.some((s) => s.player) ? `座位對應玩家：${seats.filter((s) => s.player).map((s) => `${s.id}=${s.player}`).join('、')}（發言若用名字稱呼，對應回座位）` : ''}
+
+發言片段：
+${segment}
+
+偵測跳身分，只回傳 JSON。`
+  const raw = await chatJSON(EXTRACT_SYSTEM, user, 400, 0)
+  const parsed = JSON.parse(raw) as { claims?: { seat: string; claim: string }[] }
+  // 只留座位合法的結果
+  return (parsed.claims ?? []).filter((c) => seatIds.includes(c.seat) && c.claim)
+}
+
 // ---- 判狼 ----
 
 function lessonsBlock(lessons: Lesson[]): string {

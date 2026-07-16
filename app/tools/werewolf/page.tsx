@@ -14,7 +14,7 @@ type Board = {
   mySeat?: string // 我本人的座位（明身份）
   myRole?: string
 }
-type RosterPlayer = { id: string; name: string; note?: string }
+type RosterPlayer = { id: string; name: string; note?: string; isMe?: boolean }
 type SeatVerdict = { seat: string; roleGuess: string; suspicion: number; reason: string }
 type Judgement = { seats: SeatVerdict[]; topWolves: string[]; overall: string; confidence: number }
 type Lesson = { id: string; ts: number; gameId?: string; title: string; insight: string }
@@ -147,7 +147,15 @@ export default function WerewolfPage() {
   useEffect(() => {
     setLessons(load<Lesson[]>(LS.lessons, []))
     setGames(load<Game[]>(LS.games, []))
-    setRoster(load<RosterPlayer[]>(LS.roster, []))
+    // 名冊：確保有一張「阿康之神」（使用者本人）的卡
+    const r = load<RosterPlayer[]>(LS.roster, [])
+    if (!r.some((p) => p.isMe)) {
+      const seeded = [{ id: uid(), name: '阿康之神', isMe: true }, ...r]
+      setRoster(seeded)
+      save(LS.roster, seeded)
+    } else {
+      setRoster(r)
+    }
     const cur = load<(Partial<Game> & { phase?: Phase }) | null>(LS.current, null)
     if (cur && cur.board) {
       setBoard(cur.board)
@@ -163,6 +171,13 @@ export default function WerewolfPage() {
   useEffect(() => {
     save(LS.current, { id: gameId, board, transcript, events, judgement, phase })
   }, [gameId, board, transcript, events, judgement, phase])
+
+  // ---- 「阿康之神」指派到哪格，那格就是我的座位 ----
+  useEffect(() => {
+    const meName = roster.find((p) => p.isMe)?.name
+    const mySeat = meName ? board.seats.find((s) => s.player === meName)?.id : undefined
+    if (board.mySeat !== mySeat) setBoard((b) => ({ ...b, mySeat }))
+  }, [board.seats, board.mySeat, roster])
 
   // ---- 板子調整 ----
   function setPlayers(n: number) {
@@ -268,11 +283,37 @@ export default function WerewolfPage() {
         // 有指定發言者 → 自動掛名
         const entry = segSpeaker ? `${segSpeaker}：${text}` : text
         setTranscript((t) => (t ? t + '\n' + entry : entry))
+        void autoDetectClaims(entry) // 背景偵測跳身分，不擋轉錄
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : '轉錄失敗')
     } finally {
       setTranscribing(false)
+    }
+  }
+
+  // 跳身分自動偵測：轉錄完一段就掃一遍「誰跳了什麼」，自動填進場上狀態。
+  // 靜默失敗（偵測只是輔助，不要跳錯誤打斷對局）；手動修改隨時可以覆蓋。
+  async function autoDetectClaims(segment: string) {
+    try {
+      const res = await fetch('/api/tools/werewolf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'extract',
+          segment,
+          seats: board.seats.map((s) => ({ id: s.id, player: s.player })),
+        }),
+      })
+      const json = await res.json()
+      if (!res.ok || !Array.isArray(json.claims) || json.claims.length === 0) return
+      const claimMap = new Map<string, string>(json.claims.map((c: { seat: string; claim: string }) => [c.seat, c.claim]))
+      setBoard((b) => ({
+        ...b,
+        seats: b.seats.map((s) => (claimMap.has(s.id) ? { ...s, claim: claimMap.get(s.id) } : s)),
+      }))
+    } catch {
+      // 靜默：偵測失敗不影響主流程
     }
   }
 
@@ -615,33 +656,22 @@ export default function WerewolfPage() {
               </section>
 
               <section className="rounded-2xl p-4" style={cardStyle}>
-                <h2 className="text-white font-medium mb-3">我</h2>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="text-sm text-slate-400">
-                    ★ 我的座位
-                    <select
-                      value={board.mySeat ?? ''}
-                      onChange={(e) => setBoard((b) => ({ ...b, mySeat: e.target.value || undefined }))}
-                      className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
-                      style={inputStyle}
-                    >
-                      <option value="">（未設定）</option>
-                      {board.seats.map((s) => (
-                        <option key={s.id} value={s.id}>{s.id}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="text-sm text-slate-400">
-                    我的真實身份
-                    <input
-                      value={board.myRole ?? ''}
-                      onChange={(e) => setBoard((b) => ({ ...b, myRole: e.target.value || undefined }))}
-                      placeholder="例：女巫（明牌給 AI 推理）"
-                      className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
-                      style={inputStyle}
-                    />
-                  </label>
-                </div>
+                <h2 className="text-white font-medium mb-1">我（阿康之神）</h2>
+                <p className="text-xs text-slate-500 mb-3">
+                  在下方座位指派把「阿康之神」放到你的座位，那格就是你
+                  {board.mySeat ? <span className="text-violet-300">（目前：{board.mySeat}★）</span> : <span className="text-amber-400">（還沒指派）</span>}
+                  。身份填了 AI 就當確定資訊推理。
+                </p>
+                <label className="text-sm text-slate-400 block">
+                  我的真實身份
+                  <input
+                    value={board.myRole ?? ''}
+                    onChange={(e) => setBoard((b) => ({ ...b, myRole: e.target.value || undefined }))}
+                    placeholder="例：女巫（明牌給 AI，其他跳女巫的必為假跳）"
+                    className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
+                    style={inputStyle}
+                  />
+                </label>
               </section>
 
               <section className="rounded-2xl p-4" style={cardStyle}>
@@ -1039,17 +1069,22 @@ export default function WerewolfPage() {
             return (
               <div key={p.id} className="rounded-xl px-4 py-3" style={cardStyle}>
                 <div className="flex items-center justify-between">
-                  <span className="text-white font-medium">{p.name}</span>
-                  <button
-                    onClick={() => {
-                      const next = roster.filter((r) => r.id !== p.id)
-                      setRoster(next)
-                      save(LS.roster, next)
-                    }}
-                    className="text-xs text-slate-600 hover:text-red-400"
-                  >
-                    刪除
-                  </button>
+                  <span className="text-white font-medium">
+                    {p.name}
+                    {p.isMe && <span className="ml-2 text-xs text-violet-300">★ 我本人</span>}
+                  </span>
+                  {!p.isMe && (
+                    <button
+                      onClick={() => {
+                        const next = roster.filter((r) => r.id !== p.id)
+                        setRoster(next)
+                        save(LS.roster, next)
+                      }}
+                      className="text-xs text-slate-600 hover:text-red-400"
+                    >
+                      刪除
+                    </button>
+                  )}
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
                   出場 {played.length} 局 ・ 當狼 {wolfGames.length} 次
