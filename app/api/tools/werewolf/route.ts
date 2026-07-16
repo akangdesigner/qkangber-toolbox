@@ -23,8 +23,10 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: '音檔是空的' }, { status: 400 })
       }
       // mode=tone → Gemini 聽音檔並標語氣；否則走 whisper 純文字
+      // （GROQ_API_KEY 沒設定時，純文字模式也自動退到 Gemini）
       const mode = form.get('mode')
-      const text = mode === 'tone' ? await transcribeWithTone(audio) : await transcribeAudio(audio)
+      const useTone = mode === 'tone' || !process.env.GROQ_API_KEY
+      const text = useTone ? await transcribeWithTone(audio) : await transcribeAudio(audio)
       return NextResponse.json({ success: true, text })
     }
 
