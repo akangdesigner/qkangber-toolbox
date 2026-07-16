@@ -11,3 +11,7 @@ next-env.d.ts
 
 # 思念機器人：使用者私密對話資料，絕不進版控
 /data/memory-bot
+
+# 訊號日誌與自選清單備份：本機執行期資料，不進版控
+/data/signal-log
+/data/watchlist.json

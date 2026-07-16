@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { analyzeStock } from '@/lib/stock'
+import { analyzeStock, type StockHealth } from '@/lib/stock'
+import { logSnapshot } from '@/lib/signal-log'
 
 export const dynamic = 'force-dynamic'
 
@@ -18,6 +19,9 @@ export async function GET(req: NextRequest) {
 
   try {
     const results = await Promise.all(symbols.map((s) => analyzeStock(s)))
+    // 開頁被動補記訊號日誌：排程沒跑到的日子，只要有開頁看盤當天就有紀錄（假日防呆在 logSnapshot 內）
+    const healthy = results.filter((r): r is StockHealth => !('error' in r))
+    await logSnapshot(healthy, null, 'page').catch(() => {})
     return NextResponse.json({ ok: true, results, asOf: new Date().toISOString() })
   } catch (e) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })
