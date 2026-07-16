@@ -27,6 +27,20 @@ type WorldAnalysis = {
   counterEvidence: string[]
   summary: string
 }
+type SpeechAudit = {
+  seat: string
+  evidence: {
+    id: string
+    phase: string
+    quote: string
+    finding: string
+    severity: 'hard' | 'medium' | 'weak' | 'none'
+    wolfInterpretation: string
+    goodInterpretation: string
+  }[]
+  timelineVerdict: string
+  consistencyVerdict: string
+}
 type Judgement = {
   seats: SeatVerdict[]
   topWolves: string[]
@@ -34,6 +48,7 @@ type Judgement = {
   confidence: number
   worlds?: WorldAnalysis[]
   selectedWorld?: string
+  speechAudits?: SpeechAudit[]
 }
 type Lesson = { id: string; ts: number; gameId?: string; title: string; insight: string }
 type Truth = { seat: string; role: string; isWolf: boolean }
@@ -1698,6 +1713,37 @@ export default function WerewolfPage() {
                 </div>
                 {judgement && (
                   <div className="space-y-3">
+                    {judgement.speechAudits && judgement.speechAudits.some((audit) => audit.evidence.length > 0) && (
+                      <details className="rounded-xl p-3" style={inputStyle}>
+                        <summary className="cursor-pointer text-sm font-semibold text-white">
+                          逐人逐句審查（判狼證據來源）
+                        </summary>
+                        <div className="mt-3 space-y-3">
+                          {judgement.speechAudits.map((audit) => (
+                            <div key={audit.seat} className="border-t border-white/5 pt-2 first:border-0 first:pt-0">
+                              <p className="text-sm font-medium text-violet-300">{audit.seat}</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                                時間軸：{audit.timelineVerdict}｜一致性：{audit.consistencyVerdict}
+                              </p>
+                              {audit.evidence.map((entry) => (
+                                <div key={entry.id} className="mt-2 rounded-lg bg-black/20 p-2">
+                                  <div className="flex items-center gap-2 text-[10px]">
+                                    <span className={entry.severity === 'hard' ? 'text-red-300' : entry.severity === 'medium' ? 'text-amber-300' : 'text-slate-500'}>
+                                      {entry.id}・{entry.severity}
+                                    </span>
+                                    <span className="text-slate-600">{entry.phase}</span>
+                                  </div>
+                                  <p className="mt-1 text-xs text-slate-300">「{entry.quote}」</p>
+                                  <p className="mt-1 text-xs leading-relaxed text-slate-400">{entry.finding}</p>
+                                  <p className="mt-1 text-[11px] leading-relaxed text-red-300/70">狼面：{entry.wolfInterpretation}</p>
+                                  <p className="text-[11px] leading-relaxed text-emerald-300/70">好人面：{entry.goodInterpretation}</p>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
                     {judgement.worlds && judgement.worlds.length === 2 && (
                       <div className="grid gap-2 sm:grid-cols-2">
                         {judgement.worlds.map((world) => {
