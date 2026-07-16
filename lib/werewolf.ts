@@ -11,7 +11,8 @@ const WHISPER_MODEL = 'whisper-large-v3-turbo'
 export type Seat = {
   id: string // 座位標籤，例如 "1號"
   player?: string // 名冊玩家名（固定牌友，跨局累積行為檔案用）
-  claim?: string // 自報身分（可選）
+  claim?: string // 跳身分：對局中玩家聲稱的身分（例：跳預言家）
+  out?: boolean // 已出局
 }
 
 export type Board = {
@@ -221,7 +222,8 @@ export async function judge(payload: {
     .map((s) => {
       const parts = [s.id]
       if (s.player) parts.push(`玩家：${s.player}`)
-      if (s.claim) parts.push(`自報：${s.claim}`)
+      if (s.claim) parts.push(`跳身分：${s.claim}`)
+      if (s.out) parts.push('已出局')
       if (board.mySeat && s.id === board.mySeat) parts.push('★使用者本人')
       return `- ${parts.join('，')}`
     })

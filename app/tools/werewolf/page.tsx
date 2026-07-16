@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 
 // ---- 型別（跟 lib/werewolf.ts 對齊）----
-type Seat = { id: string; player?: string; claim?: string }
+type Seat = { id: string; player?: string; claim?: string; out?: boolean }
 type Board = {
   players: number
   wolves: number
@@ -19,6 +19,7 @@ type SeatVerdict = { seat: string; roleGuess: string; suspicion: number; reason:
 type Judgement = { seats: SeatVerdict[]; topWolves: string[]; overall: string; confidence: number }
 type Lesson = { id: string; ts: number; gameId?: string; title: string; insight: string }
 type Truth = { seat: string; role: string; isWolf: boolean }
+type Phase = 'setup' | 'live' | 'review'
 type Game = {
   id: string
   createdAt: number
@@ -54,13 +55,13 @@ function save(key: string, val: unknown) {
   } catch {}
 }
 function makeSeats(n: number, prev: Seat[]): Seat[] {
-  return Array.from({ length: n }, (_, i) => prev[i] ?? { id: `${i + 1}號`, claim: '' })
+  return Array.from({ length: n }, (_, i) => prev[i] ?? { id: `${i + 1}號` })
 }
 function emptyBoard(): Board {
-  return { players: 9, wolves: 3, roles: '狼人x3、預言家、女巫、獵人、平民x3', seats: makeSeats(9, []), note: '' }
+  return { players: 12, wolves: 4, roles: '狼人x3、狼王、預言家、女巫、獵人、守衛、平民x4', seats: makeSeats(12, []), note: '' }
 }
 
-// 常見 12 人板子預設。點了會覆蓋板子設定（座位自報保留可再編輯）。
+// 常見 12 人板子預設。點了會覆蓋板子設定（座位指派保留可再編輯）。
 // note 會帶特殊角色技能說明，讓 AI 判狼時看得懂這些角色——內容可依你們的實際規則修改。
 const PRESETS: { name: string; players: number; wolves: number; roles: string; note: string }[] = [
   {
@@ -102,6 +103,7 @@ const PRESETS: { name: string; players: number; wolves: number; roles: string; n
 
 export default function WerewolfPage() {
   const [tab, setTab] = useState<'game' | 'roster' | 'lessons' | 'history'>('game')
+  const [phase, setPhase] = useState<Phase>('setup')
 
   // 本局狀態
   const [board, setBoard] = useState<Board>(emptyBoard)
@@ -146,20 +148,21 @@ export default function WerewolfPage() {
     setLessons(load<Lesson[]>(LS.lessons, []))
     setGames(load<Game[]>(LS.games, []))
     setRoster(load<RosterPlayer[]>(LS.roster, []))
-    const cur = load<Partial<Game> | null>(LS.current, null)
+    const cur = load<(Partial<Game> & { phase?: Phase }) | null>(LS.current, null)
     if (cur && cur.board) {
       setBoard(cur.board)
       setTranscript(cur.transcript ?? '')
       setEvents(cur.events ?? [])
       setJudgement(cur.judgement ?? null)
       setGameId(cur.id ?? uid())
+      setPhase(cur.phase ?? 'setup')
     }
   }, [])
 
   // ---- 自動存本局進度 ----
   useEffect(() => {
-    save(LS.current, { id: gameId, board, transcript, events, judgement })
-  }, [gameId, board, transcript, events, judgement])
+    save(LS.current, { id: gameId, board, transcript, events, judgement, phase })
+  }, [gameId, board, transcript, events, judgement, phase])
 
   // ---- 板子調整 ----
   function setPlayers(n: number) {
@@ -171,6 +174,7 @@ export default function WerewolfPage() {
   }
   function applyPreset(p: (typeof PRESETS)[number]) {
     setBoard((b) => ({
+      ...b,
       players: p.players,
       wolves: p.wolves,
       roles: p.roles,
@@ -179,7 +183,7 @@ export default function WerewolfPage() {
     }))
   }
 
-  // ---- 錄音：自動分段轉錄 ----
+  // ---- 錄音：點發言者切段 ----
   async function startRecording() {
     setError('')
     try {
@@ -405,6 +409,7 @@ export default function WerewolfPage() {
 
   function newGame() {
     if (!confirm('開新的一局？目前這局若還沒復盤存檔會清掉。')) return
+    if (recording) stopRecording()
     setBoard(emptyBoard())
     setTranscript('')
     setEvents([])
@@ -416,6 +421,7 @@ export default function WerewolfPage() {
     setGameId(uid())
     setSpeaker('')
     speakerRef.current = ''
+    setPhase('setup')
   }
 
   function deleteLesson(id: string) {
@@ -471,6 +477,8 @@ export default function WerewolfPage() {
         )
       : null
 
+  const aliveCount = board.seats.filter((s) => !s.out).length
+
   // ---- 樣式 helper ----
   const cardStyle = { background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }
   const inputStyle = { background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }
@@ -482,12 +490,9 @@ export default function WerewolfPage() {
         <h1 className="text-2xl sm:text-3xl font-semibold text-white tracking-[-0.02em]">狼人殺筆記</h1>
         <Link href="/" className="text-sm text-slate-400 hover:text-slate-200">← 回工具箱</Link>
       </div>
-      <p className="text-slate-400 mb-6 text-sm">
-        錄音自動轉逐字稿 → 標發言者 → AI 判狼 → 賽後復盤比對，教訓越存越多，判得越準。
-      </p>
 
       {/* 分頁 */}
-      <div className="flex gap-2 mb-6">
+      <div className="flex gap-2 mb-6 flex-wrap">
         {([['game', '本局'], ['roster', `名冊 ${roster.length}`], ['lessons', `教訓庫 ${lessons.length}`], ['history', `歷史 ${games.length}`]] as const).map(
           ([key, label]) => (
             <button
@@ -518,377 +523,476 @@ export default function WerewolfPage() {
       {/* ============ 本局 ============ */}
       {tab === 'game' && (
         <div className="space-y-5">
-          {/* 板子設定 */}
-          <section className="rounded-2xl p-4" style={cardStyle}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-white font-medium">① 板子設定</h2>
-              <button onClick={newGame} className="text-xs text-slate-400 hover:text-slate-200 underline decoration-dotted">
-                開新一局
-              </button>
-            </div>
-            <div className="flex flex-wrap gap-2 mb-4">
-              {PRESETS.map((p) => (
+          {/* 階段指示 */}
+          <div className="flex items-center gap-2 text-sm">
+            {(
+              [
+                ['setup', '① 開局設定'],
+                ['live', '② 實戰'],
+                ['review', '③ 復盤'],
+              ] as const
+            ).map(([p, label], i) => (
+              <span key={p} className="flex items-center gap-2">
+                {i > 0 && <span className="text-slate-700">→</span>}
                 <button
-                  key={p.name}
-                  onClick={() => applyPreset(p)}
-                  className="px-3 py-1.5 rounded-full text-xs transition-colors"
+                  onClick={() => setPhase(p)}
+                  className="px-3 py-1 rounded-full text-xs font-medium"
                   style={
-                    board.roles === p.roles
-                      ? { background: gradient, color: '#fff' }
-                      : { ...inputStyle, color: '#94a3b8' }
+                    phase === p
+                      ? { background: 'rgba(139,92,246,0.2)', color: '#c4b5fd', border: '1px solid rgba(139,92,246,0.4)' }
+                      : { color: '#64748b' }
                   }
                 >
-                  {p.name}
+                  {label}
                 </button>
-              ))}
-            </div>
-            <div className="grid grid-cols-2 gap-3 mb-3">
-              <label className="text-sm text-slate-400">
-                玩家人數
-                <input
-                  type="number"
-                  value={board.players}
-                  onChange={(e) => setPlayers(Number(e.target.value))}
-                  className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
-                  style={inputStyle}
-                />
-              </label>
-              <label className="text-sm text-slate-400">
-                狼人數量
-                <input
-                  type="number"
-                  value={board.wolves}
-                  onChange={(e) => setBoard((b) => ({ ...b, wolves: Math.max(1, Number(e.target.value) || 1) }))}
-                  className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
-                  style={inputStyle}
-                />
-              </label>
-            </div>
-            <label className="text-sm text-slate-400 block mb-3">
-              身分配置
-              <input
-                value={board.roles}
-                onChange={(e) => setBoard((b) => ({ ...b, roles: e.target.value }))}
-                className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
-                style={inputStyle}
-              />
-            </label>
-            <div className="grid grid-cols-2 gap-3 mb-3 rounded-xl p-3" style={{ background: 'rgba(139,92,246,0.06)' }}>
-              <label className="text-sm text-slate-400">
-                ★ 我的座位
-                <select
-                  value={board.mySeat ?? ''}
-                  onChange={(e) => setBoard((b) => ({ ...b, mySeat: e.target.value || undefined }))}
-                  className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
-                  style={inputStyle}
-                >
-                  <option value="">（未設定）</option>
-                  {board.seats.map((s) => (
-                    <option key={s.id} value={s.id}>{s.id}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-sm text-slate-400">
-                我的真實身份（明牌給 AI 當推理起點）
-                <input
-                  value={board.myRole ?? ''}
-                  onChange={(e) => setBoard((b) => ({ ...b, myRole: e.target.value || undefined }))}
-                  placeholder="例：女巫"
-                  className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
-                  style={inputStyle}
-                />
-              </label>
-            </div>
-            <div className="space-y-2">
-              <p className="text-xs text-slate-500">
-                座位／指派名冊玩家（教訓會綁定玩家跨局累積）／自報身分
-                {roster.length === 0 && (
-                  <button onClick={() => setTab('roster')} className="ml-2 text-violet-400 underline decoration-dotted">
-                    先去登記牌友 →
-                  </button>
-                )}
-              </p>
-              {board.seats.map((s, i) => (
-                <div key={i} className="flex gap-2">
-                  <input
-                    value={s.id}
-                    onChange={(e) => setSeat(i, { id: e.target.value })}
-                    className={`w-16 rounded-lg px-2 py-2 text-sm focus:outline-none ${board.mySeat === s.id ? 'text-violet-300' : 'text-white'}`}
-                    style={inputStyle}
-                  />
-                  <select
-                    value={s.player ?? ''}
-                    onChange={(e) => setSeat(i, { player: e.target.value || undefined })}
-                    className="w-28 rounded-lg px-2 py-2 text-sm focus:outline-none"
-                    style={{ ...inputStyle, color: s.player ? '#c4b5fd' : '#64748b' }}
-                  >
-                    <option value="">（路人）</option>
-                    {roster.map((p) => (
-                      <option key={p.id} value={p.name}>{p.name}</option>
-                    ))}
-                  </select>
-                  <input
-                    value={s.claim ?? ''}
-                    onChange={(e) => setSeat(i, { claim: e.target.value })}
-                    placeholder="自報身分"
-                    className="flex-1 min-w-0 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
-                    style={inputStyle}
-                  />
-                </div>
-              ))}
-            </div>
-            <input
-              value={board.note ?? ''}
-              onChange={(e) => setBoard((b) => ({ ...b, note: e.target.value }))}
-              placeholder="情境備註（第幾晚、出過刀沒、特殊規則…）"
-              className="mt-3 w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
-              style={inputStyle}
-            />
-          </section>
+              </span>
+            ))}
+            <button onClick={newGame} className="ml-auto text-xs text-slate-500 hover:text-slate-300 underline decoration-dotted">
+              開新一局
+            </button>
+          </div>
 
-          {/* 逐字稿 / 錄音 */}
-          <section className="rounded-2xl p-4" style={cardStyle}>
-            <h2 className="text-white font-medium mb-3">② 逐字稿</h2>
-            <div className="flex flex-wrap gap-2 mb-3 items-center">
-              <div className="flex rounded-full overflow-hidden text-xs" style={inputStyle}>
-                {(['mic', 'tab'] as const).map((m) => (
-                  <button
-                    key={m}
-                    onClick={() => setRecMode(m)}
-                    disabled={recording}
-                    className="px-3 py-1.5"
-                    style={recMode === m ? { background: gradient, color: '#fff' } : { color: '#94a3b8' }}
-                  >
-                    {m === 'mic' ? '🎤 麥克風' : '💻 分頁內錄'}
-                  </button>
-                ))}
-              </div>
-              {!recording ? (
-                <button
-                  onClick={startRecording}
-                  className="px-4 py-1.5 rounded-full text-white text-sm font-medium"
-                  style={{ background: gradient }}
-                >
-                  開始錄音
-                </button>
-              ) : (
-                <button
-                  onClick={stopRecording}
-                  className="px-4 py-1.5 rounded-full text-white text-sm font-medium"
-                  style={{ background: 'linear-gradient(135deg,#ef4444,#f97316)' }}
-                >
-                  ■ 停止錄音
-                </button>
-              )}
-              <label className="px-3 py-1.5 rounded-full text-slate-300 text-xs cursor-pointer" style={inputStyle}>
-                上傳音檔
-                <input type="file" accept="audio/*" onChange={onUploadAudio} className="hidden" />
-              </label>
-              <button
-                onClick={() => {
-                  const next = !toneMode
-                  setToneMode(next)
-                  toneModeRef.current = next
-                }}
-                className="px-3 py-1.5 rounded-full text-xs"
-                style={
-                  toneMode
-                    ? { background: 'rgba(139,92,246,0.15)', color: '#c4b5fd', border: '1px solid rgba(139,92,246,0.35)' }
-                    : { ...inputStyle, color: '#64748b' }
-                }
-                title="開啟時音檔交給 Gemini 聽，逐字稿會自動標語氣（停頓/遲疑/笑…）；關閉時走 whisper 純文字"
-              >
-                {toneMode ? '🎭 語氣標註 開' : '語氣標註 關'}
-              </button>
-              {recording && <span className="text-xs text-red-400 animate-pulse">● 錄音中</span>}
-              {transcribing && <span className="text-xs text-violet-300">轉錄中…</span>}
-            </div>
-            {recording && (
-              <div className="mb-3 rounded-xl p-3" style={{ background: 'rgba(139,92,246,0.06)' }}>
-                <p className="text-xs text-slate-400 mb-2">
-                  誰在發言？換人時點一下座位 → 上一段自動送轉錄並掛名（再點同座位＝取消掛名）
-                </p>
-                <div className="flex flex-wrap gap-1.5">
-                  {board.seats.map((s) => (
+          {/* ======== 階段一：開局設定 ======== */}
+          {phase === 'setup' && (
+            <>
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <h2 className="text-white font-medium mb-3">板子</h2>
+                <div className="flex flex-wrap gap-2 mb-4">
+                  {PRESETS.map((p) => (
                     <button
-                      key={s.id}
-                      onClick={() => switchSpeaker(s.id)}
-                      className="px-3 py-1.5 rounded-full text-xs font-medium"
+                      key={p.name}
+                      onClick={() => applyPreset(p)}
+                      className="px-3 py-1.5 rounded-full text-xs transition-colors"
                       style={
-                        speaker === s.id
+                        board.roles === p.roles
                           ? { background: gradient, color: '#fff' }
                           : { ...inputStyle, color: '#94a3b8' }
                       }
                     >
-                      {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
+                      {p.name}
                     </button>
                   ))}
                 </div>
-                {speaker && <p className="text-xs text-violet-300 mt-2">🎙 現在發言：{speaker}</p>}
-              </div>
-            )}
-            <textarea
-              value={transcript}
-              onChange={(e) => setTranscript(e.target.value)}
-              placeholder={'逐字稿會自動長在這裡。\n建議手動標上發言者，例如：\n1號：我是預言家，昨晚驗2號金水…\n3號：我覺得1號跳得太急'}
-              rows={10}
-              className="w-full rounded-lg px-3 py-3 text-white text-sm placeholder-slate-600 focus:outline-none font-mono leading-relaxed"
-              style={inputStyle}
-            />
-          </section>
-
-          {/* 戰況記錄 */}
-          <section className="rounded-2xl p-4" style={cardStyle}>
-            <h2 className="text-white font-medium mb-1">③ 戰況記錄</h2>
-            <p className="text-xs text-slate-500 mb-3">
-              實時回報硬資訊：昨晚誰出局、票型、警上陣容、警長歸屬、退水…判狼時這些優先度比發言高。
-            </p>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                const t = eventInput.trim()
-                if (!t) return
-                setEvents((prev) => [...prev, t])
-                setEventInput('')
-              }}
-              className="flex gap-2 mb-3"
-            >
-              <input
-                value={eventInput}
-                onChange={(e) => setEventInput(e.target.value)}
-                placeholder="例：第一晚 5號出局／首日票型 1,3,7投5；5被放逐／警長給4號"
-                className="flex-1 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
-                style={inputStyle}
-              />
-              <button
-                type="submit"
-                className="px-4 rounded-lg text-white text-sm font-medium"
-                style={{ background: gradient }}
-              >
-                記錄
-              </button>
-            </form>
-            {events.length > 0 && (
-              <div className="space-y-1.5">
-                {events.map((ev, i) => (
-                  <div key={i} className="flex items-start gap-2 rounded-lg px-3 py-2 text-sm" style={inputStyle}>
-                    <span className="text-slate-500 text-xs shrink-0 mt-0.5">{i + 1}.</span>
-                    <span className="flex-1 text-slate-300">{ev}</span>
-                    <button
-                      onClick={() => setEvents((prev) => prev.filter((_, idx) => idx !== i))}
-                      className="text-xs text-slate-600 hover:text-red-400 shrink-0"
-                    >
-                      刪
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-          {/* 判狼 */}
-          <section className="rounded-2xl p-4" style={cardStyle}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-white font-medium">④ AI 判狼</h2>
-              <button
-                onClick={runJudge}
-                disabled={judging}
-                className="px-5 py-2 rounded-full text-white text-sm font-medium disabled:opacity-40"
-                style={{ background: gradient }}
-              >
-                {judging ? '分析中…' : '開始判狼'}
-              </button>
-            </div>
-            {judgement && (
-              <div className="space-y-3">
-                <div className="rounded-lg p-3" style={{ background: 'rgba(139,92,246,0.08)' }}>
-                  <p className="text-xs text-violet-300 mb-1">最可疑的狼（把握 {judgement.confidence}%）</p>
-                  <p className="text-white font-medium">🐺 {judgement.topWolves.join('、') || '—'}</p>
-                  <p className="text-sm text-slate-300 mt-2">{judgement.overall}</p>
+                <div className="grid grid-cols-2 gap-3 mb-3">
+                  <label className="text-sm text-slate-400">
+                    玩家人數
+                    <input
+                      type="number"
+                      value={board.players}
+                      onChange={(e) => setPlayers(Number(e.target.value))}
+                      className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
+                      style={inputStyle}
+                    />
+                  </label>
+                  <label className="text-sm text-slate-400">
+                    狼人數量
+                    <input
+                      type="number"
+                      value={board.wolves}
+                      onChange={(e) => setBoard((b) => ({ ...b, wolves: Math.max(1, Number(e.target.value) || 1) }))}
+                      className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
+                      style={inputStyle}
+                    />
+                  </label>
                 </div>
-                <div className="space-y-1.5">
-                  {[...judgement.seats].sort((a, b) => b.suspicion - a.suspicion).map((s) => (
-                    <div key={s.seat} className="flex items-start gap-3 rounded-lg px-3 py-2" style={inputStyle}>
-                      <div className="w-14 shrink-0">
-                        <span className="text-white text-sm">{s.seat}</span>
-                      </div>
-                      <div className="w-10 shrink-0 text-right">
-                        <span
-                          className="text-sm font-semibold"
-                          style={{ color: s.suspicion >= 60 ? '#f87171' : s.suspicion >= 35 ? '#fbbf24' : '#4ade80' }}
-                        >
-                          {s.suspicion}
-                        </span>
-                      </div>
-                      <div className="flex-1">
-                        <p className="text-xs text-slate-400">
-                          猜 {s.roleGuess}
-                        </p>
-                        <p className="text-sm text-slate-300">{s.reason}</p>
-                      </div>
+                <label className="text-sm text-slate-400 block mb-3">
+                  身分配置
+                  <input
+                    value={board.roles}
+                    onChange={(e) => setBoard((b) => ({ ...b, roles: e.target.value }))}
+                    className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
+                    style={inputStyle}
+                  />
+                </label>
+                <textarea
+                  value={board.note ?? ''}
+                  onChange={(e) => setBoard((b) => ({ ...b, note: e.target.value }))}
+                  placeholder="板規／特殊角色技能說明（點預設會自動帶入，可修改）"
+                  rows={3}
+                  className="w-full rounded-lg px-3 py-2 text-slate-300 text-xs placeholder-slate-600 focus:outline-none leading-relaxed"
+                  style={inputStyle}
+                />
+              </section>
+
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <h2 className="text-white font-medium mb-3">我</h2>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-sm text-slate-400">
+                    ★ 我的座位
+                    <select
+                      value={board.mySeat ?? ''}
+                      onChange={(e) => setBoard((b) => ({ ...b, mySeat: e.target.value || undefined }))}
+                      className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
+                      style={inputStyle}
+                    >
+                      <option value="">（未設定）</option>
+                      {board.seats.map((s) => (
+                        <option key={s.id} value={s.id}>{s.id}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-sm text-slate-400">
+                    我的真實身份
+                    <input
+                      value={board.myRole ?? ''}
+                      onChange={(e) => setBoard((b) => ({ ...b, myRole: e.target.value || undefined }))}
+                      placeholder="例：女巫（明牌給 AI 推理）"
+                      className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
+                      style={inputStyle}
+                    />
+                  </label>
+                </div>
+              </section>
+
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <h2 className="text-white font-medium mb-1">座位指派</h2>
+                <p className="text-xs text-slate-500 mb-3">
+                  把名冊玩家指派到座位（教訓會綁定玩家跨局累積）。
+                  {roster.length === 0 && (
+                    <button onClick={() => setTab('roster')} className="ml-1 text-violet-400 underline decoration-dotted">
+                      先去登記牌友 →
+                    </button>
+                  )}
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  {board.seats.map((s, i) => (
+                    <div key={i} className="flex gap-1.5 items-center">
+                      <span className={`w-12 text-sm shrink-0 ${board.mySeat === s.id ? 'text-violet-300' : 'text-white'}`}>
+                        {s.id}{board.mySeat === s.id ? '★' : ''}
+                      </span>
+                      <select
+                        value={s.player ?? ''}
+                        onChange={(e) => setSeat(i, { player: e.target.value || undefined })}
+                        className="flex-1 min-w-0 rounded-lg px-2 py-1.5 text-sm focus:outline-none"
+                        style={{ ...inputStyle, color: s.player ? '#c4b5fd' : '#64748b' }}
+                      >
+                        <option value="">（路人）</option>
+                        {roster.map((p) => (
+                          <option key={p.id} value={p.name}>{p.name}</option>
+                        ))}
+                      </select>
                     </div>
                   ))}
                 </div>
-              </div>
-            )}
-          </section>
+              </section>
 
-          {/* 復盤 */}
-          <section className="rounded-2xl p-4" style={cardStyle}>
-            <h2 className="text-white font-medium mb-1">⑤ 賽後復盤</h2>
-            <p className="text-xs text-slate-500 mb-3">標出真正的身分，勾掉是狼的座位。存檔後 AI 會比對並生成教訓，之後判狼會更準。</p>
-            <div className="space-y-2 mb-3">
-              {board.seats.map((s) => {
-                const t = truthFor(s.id)
-                return (
-                  <div key={s.id} className="flex gap-2 items-center">
-                    <span className="w-14 text-sm text-white shrink-0">{s.id}</span>
-                    <input
-                      value={t.role}
-                      onChange={(e) => setTruthRole(s.id, e.target.value)}
-                      placeholder={s.id === board.mySeat && board.myRole ? `${board.myRole}（自動帶入）` : '真實身分'}
-                      className="flex-1 rounded-lg px-3 py-1.5 text-white text-sm placeholder-slate-600 focus:outline-none"
-                      style={inputStyle}
-                    />
-                    <button
-                      onClick={() => toggleTruthWolf(s.id)}
-                      className="px-3 py-1.5 rounded-lg text-sm font-medium shrink-0"
-                      style={
-                        t.isWolf
-                          ? { background: 'rgba(239,68,68,0.15)', color: '#f87171', border: '1px solid rgba(239,68,68,0.3)' }
-                          : { ...inputStyle, color: '#64748b' }
-                      }
-                    >
-                      {t.isWolf ? '🐺 狼' : '好人'}
-                    </button>
+              <button
+                onClick={() => setPhase('live')}
+                className="w-full py-3 rounded-full text-white font-medium"
+                style={{ background: gradient }}
+              >
+                開始對局 →
+              </button>
+            </>
+          )}
+
+          {/* ======== 階段二：實戰 ======== */}
+          {phase === 'live' && (
+            <>
+              {/* 錄音控制 */}
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <div className="flex flex-wrap gap-2 items-center">
+                  <div className="flex rounded-full overflow-hidden text-xs" style={inputStyle}>
+                    {(['mic', 'tab'] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => setRecMode(m)}
+                        disabled={recording}
+                        className="px-3 py-1.5"
+                        style={recMode === m ? { background: gradient, color: '#fff' } : { color: '#94a3b8' }}
+                      >
+                        {m === 'mic' ? '🎤 麥克風' : '💻 分頁內錄'}
+                      </button>
+                    ))}
                   </div>
-                )
-              })}
-            </div>
-            <input
-              value={resultText}
-              onChange={(e) => setResultText(e.target.value)}
-              placeholder="賽果（例：好人陣營勝／狼屠邊）"
-              className="w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none mb-3"
-              style={inputStyle}
-            />
-            <button
-              onClick={runReflect}
-              disabled={reflecting}
-              className="w-full py-2.5 rounded-full text-white text-sm font-medium disabled:opacity-40"
-              style={{ background: gradient }}
-            >
-              {reflecting ? '復盤中…' : '存檔並生成教訓'}
-            </button>
-            {accuracyNote && (
-              <div className="mt-3 rounded-lg p-3 text-sm text-slate-300" style={{ background: 'rgba(139,92,246,0.08)' }}>
-                {computeAccuracy() != null && (
-                  <p className="text-white font-medium mb-1">本局命中率：{computeAccuracy()}%</p>
+                  {!recording ? (
+                    <button
+                      onClick={startRecording}
+                      className="px-4 py-1.5 rounded-full text-white text-sm font-medium"
+                      style={{ background: gradient }}
+                    >
+                      開始錄音
+                    </button>
+                  ) : (
+                    <button
+                      onClick={stopRecording}
+                      className="px-4 py-1.5 rounded-full text-white text-sm font-medium"
+                      style={{ background: 'linear-gradient(135deg,#ef4444,#f97316)' }}
+                    >
+                      ■ 停止
+                    </button>
+                  )}
+                  <label className="px-3 py-1.5 rounded-full text-slate-300 text-xs cursor-pointer" style={inputStyle}>
+                    上傳音檔
+                    <input type="file" accept="audio/*" onChange={onUploadAudio} className="hidden" />
+                  </label>
+                  <button
+                    onClick={() => {
+                      const next = !toneMode
+                      setToneMode(next)
+                      toneModeRef.current = next
+                    }}
+                    className="px-3 py-1.5 rounded-full text-xs"
+                    style={
+                      toneMode
+                        ? { background: 'rgba(139,92,246,0.15)', color: '#c4b5fd', border: '1px solid rgba(139,92,246,0.35)' }
+                        : { ...inputStyle, color: '#64748b' }
+                    }
+                    title="開啟時音檔交給 Gemini 聽，逐字稿會自動標語氣（停頓/遲疑/笑…）；關閉時走 whisper 純文字"
+                  >
+                    {toneMode ? '🎭 語氣 開' : '語氣 關'}
+                  </button>
+                  {recording && <span className="text-xs text-red-400 animate-pulse">● 錄音中</span>}
+                  {transcribing && <span className="text-xs text-violet-300">轉錄中…</span>}
+                </div>
+
+                {/* 發言者切換：永遠顯示在錄音控制下方 */}
+                <div className="mt-3 rounded-xl p-3" style={{ background: 'rgba(139,92,246,0.06)' }}>
+                  <p className="text-xs text-slate-400 mb-2">
+                    誰在發言？換人時點座位 → 上一段自動轉錄掛名（再點同座位＝取消）
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {board.seats.map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => switchSpeaker(s.id)}
+                        className="px-3 py-1.5 rounded-full text-xs font-medium"
+                        style={
+                          speaker === s.id
+                            ? { background: gradient, color: '#fff' }
+                            : s.out
+                              ? { background: 'rgba(255,255,255,0.02)', color: '#475569', textDecoration: 'line-through' }
+                              : { ...inputStyle, color: '#94a3b8' }
+                        }
+                      >
+                        {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
+                      </button>
+                    ))}
+                  </div>
+                  {speaker && <p className="text-xs text-violet-300 mt-2">🎙 現在發言：{speaker}</p>}
+                </div>
+              </section>
+
+              {/* 場上狀態：跳身分 + 出局 */}
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="text-white font-medium">場上狀態</h2>
+                  <span className="text-xs text-slate-500">存活 {aliveCount}/{board.players}</span>
+                </div>
+                <p className="text-xs text-slate-500 mb-3">有人跳身分就登記（例：跳預言家、認女巫）；出局點 💀</p>
+                <div className="space-y-1.5">
+                  {board.seats.map((s, i) => (
+                    <div key={s.id} className="flex gap-2 items-center">
+                      <span
+                        className={`w-20 text-sm shrink-0 ${s.out ? 'text-slate-600 line-through' : board.mySeat === s.id ? 'text-violet-300' : 'text-white'}`}
+                      >
+                        {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
+                      </span>
+                      <input
+                        value={s.claim ?? ''}
+                        onChange={(e) => setSeat(i, { claim: e.target.value })}
+                        placeholder="跳身分"
+                        className="flex-1 min-w-0 rounded-lg px-3 py-1.5 text-white text-sm placeholder-slate-700 focus:outline-none"
+                        style={inputStyle}
+                      />
+                      <button
+                        onClick={() => setSeat(i, { out: !s.out })}
+                        className="px-2.5 py-1.5 rounded-lg text-sm shrink-0"
+                        style={
+                          s.out
+                            ? { background: 'rgba(239,68,68,0.12)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)' }
+                            : { ...inputStyle, color: '#64748b' }
+                        }
+                        title={s.out ? '已出局（點擊復活）' : '標記出局'}
+                      >
+                        💀
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              {/* 逐字稿 */}
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <h2 className="text-white font-medium mb-3">逐字稿</h2>
+                <textarea
+                  value={transcript}
+                  onChange={(e) => setTranscript(e.target.value)}
+                  placeholder={'錄音轉出的文字會自動長在這裡（含發言者掛名與語氣標註），可隨時手動修改補充。'}
+                  rows={8}
+                  className="w-full rounded-lg px-3 py-3 text-white text-sm placeholder-slate-600 focus:outline-none font-mono leading-relaxed"
+                  style={inputStyle}
+                />
+              </section>
+
+              {/* 戰況記錄 */}
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <h2 className="text-white font-medium mb-1">戰況記錄</h2>
+                <p className="text-xs text-slate-500 mb-3">
+                  回報硬資訊：夜間死訊、警上陣容、退水、警長歸屬、票型…判狼時優先度比發言高。
+                </p>
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    const t = eventInput.trim()
+                    if (!t) return
+                    setEvents((prev) => [...prev, t])
+                    setEventInput('')
+                  }}
+                  className="flex gap-2 mb-3"
+                >
+                  <input
+                    value={eventInput}
+                    onChange={(e) => setEventInput(e.target.value)}
+                    placeholder="例：首夜5號倒牌／警上2,4,8；8退水／票型1,3,7投5"
+                    className="flex-1 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
+                    style={inputStyle}
+                  />
+                  <button type="submit" className="px-4 rounded-lg text-white text-sm font-medium" style={{ background: gradient }}>
+                    記錄
+                  </button>
+                </form>
+                {events.length > 0 && (
+                  <div className="space-y-1.5">
+                    {events.map((ev, i) => (
+                      <div key={i} className="flex items-start gap-2 rounded-lg px-3 py-2 text-sm" style={inputStyle}>
+                        <span className="text-slate-500 text-xs shrink-0 mt-0.5">{i + 1}.</span>
+                        <span className="flex-1 text-slate-300">{ev}</span>
+                        <button
+                          onClick={() => setEvents((prev) => prev.filter((_, idx) => idx !== i))}
+                          className="text-xs text-slate-600 hover:text-red-400 shrink-0"
+                        >
+                          刪
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 )}
-                {accuracyNote}
-              </div>
-            )}
-          </section>
+              </section>
+
+              {/* 判狼 */}
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-white font-medium">AI 判狼</h2>
+                  <button
+                    onClick={runJudge}
+                    disabled={judging}
+                    className="px-5 py-2 rounded-full text-white text-sm font-medium disabled:opacity-40"
+                    style={{ background: gradient }}
+                  >
+                    {judging ? '分析中…' : '判狼'}
+                  </button>
+                </div>
+                {judgement && (
+                  <div className="space-y-3">
+                    <div className="rounded-lg p-3" style={{ background: 'rgba(139,92,246,0.08)' }}>
+                      <p className="text-xs text-violet-300 mb-1">最可疑的狼（把握 {judgement.confidence}%）</p>
+                      <p className="text-white font-medium">🐺 {judgement.topWolves.join('、') || '—'}</p>
+                      <p className="text-sm text-slate-300 mt-2">{judgement.overall}</p>
+                    </div>
+                    <div className="space-y-1.5">
+                      {[...judgement.seats].sort((a, b) => b.suspicion - a.suspicion).map((s) => (
+                        <div key={s.seat} className="flex items-start gap-3 rounded-lg px-3 py-2" style={inputStyle}>
+                          <div className="w-14 shrink-0">
+                            <span className="text-white text-sm">{s.seat}</span>
+                          </div>
+                          <div className="w-10 shrink-0 text-right">
+                            <span
+                              className="text-sm font-semibold"
+                              style={{ color: s.suspicion >= 60 ? '#f87171' : s.suspicion >= 35 ? '#fbbf24' : '#4ade80' }}
+                            >
+                              {s.suspicion}
+                            </span>
+                          </div>
+                          <div className="flex-1">
+                            <p className="text-xs text-slate-400">猜 {s.roleGuess}</p>
+                            <p className="text-sm text-slate-300">{s.reason}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              <button
+                onClick={() => setPhase('review')}
+                className="w-full py-3 rounded-full text-white font-medium"
+                style={{ background: 'linear-gradient(135deg,#0ea5e9,#6366f1)' }}
+              >
+                對局結束，進入復盤 →
+              </button>
+            </>
+          )}
+
+          {/* ======== 階段三：復盤 ======== */}
+          {phase === 'review' && (
+            <>
+              <section className="rounded-2xl p-4" style={cardStyle}>
+                <h2 className="text-white font-medium mb-1">賽後復盤</h2>
+                <p className="text-xs text-slate-500 mb-3">
+                  標出真正的身分、勾出狼。存檔後 AI 比對預測生成教訓，之後判狼更準。
+                </p>
+                <div className="space-y-2 mb-3">
+                  {board.seats.map((s) => {
+                    const t = truthFor(s.id)
+                    return (
+                      <div key={s.id} className="flex gap-2 items-center">
+                        <span className="w-20 text-sm text-white shrink-0">
+                          {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
+                        </span>
+                        <input
+                          value={t.role}
+                          onChange={(e) => setTruthRole(s.id, e.target.value)}
+                          placeholder={s.id === board.mySeat && board.myRole ? `${board.myRole}（自動帶入）` : '真實身分'}
+                          className="flex-1 rounded-lg px-3 py-1.5 text-white text-sm placeholder-slate-600 focus:outline-none"
+                          style={inputStyle}
+                        />
+                        <button
+                          onClick={() => toggleTruthWolf(s.id)}
+                          className="px-3 py-1.5 rounded-lg text-sm font-medium shrink-0"
+                          style={
+                            t.isWolf
+                              ? { background: 'rgba(239,68,68,0.15)', color: '#f87171', border: '1px solid rgba(239,68,68,0.3)' }
+                              : { ...inputStyle, color: '#64748b' }
+                          }
+                        >
+                          {t.isWolf ? '🐺 狼' : '好人'}
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+                <input
+                  value={resultText}
+                  onChange={(e) => setResultText(e.target.value)}
+                  placeholder="賽果（例：好人陣營勝／狼屠邊）"
+                  className="w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none mb-3"
+                  style={inputStyle}
+                />
+                <button
+                  onClick={runReflect}
+                  disabled={reflecting}
+                  className="w-full py-2.5 rounded-full text-white text-sm font-medium disabled:opacity-40"
+                  style={{ background: gradient }}
+                >
+                  {reflecting ? '復盤中…' : '存檔並生成教訓'}
+                </button>
+                {accuracyNote && (
+                  <div className="mt-3 rounded-lg p-3 text-sm text-slate-300" style={{ background: 'rgba(139,92,246,0.08)' }}>
+                    {computeAccuracy() != null && (
+                      <p className="text-white font-medium mb-1">本局命中率：{computeAccuracy()}%</p>
+                    )}
+                    {accuracyNote}
+                    <p className="text-xs text-slate-500 mt-2">教訓已存入教訓庫；按上方「開新一局」開始下一場。</p>
+                  </div>
+                )}
+              </section>
+              <button onClick={() => setPhase('live')} className="text-sm text-slate-400 hover:text-slate-200 underline decoration-dotted">
+                ← 回實戰（補逐字稿/戰況）
+              </button>
+            </>
+          )}
         </div>
       )}
 
