@@ -4,7 +4,7 @@ const tools = [
   { href: '/watch', title: '自選股健檢', desc: '輸入台股代號，盤後日K自動算均線/KD/MACD，紅綠燈看多空', ready: true },
   { href: '/news', title: '新聞轉發控制台', desc: '看候選新聞、改草稿、直接發 Threads 或複製自己發', ready: true },
   { href: '/tools/social-post', title: '社群貼文產生器', desc: '長文拆成主貼文＋第一則留言', ready: true },
-  { href: '/tools/idea-spark', title: '創業靈感雷達', desc: '抓 Hacker News 的 Show HN，AI 翻中文＋補延伸靈感', ready: true },
+  { href: '/tools/idea-spark', title: '創業靈感雷達', desc: '時事點子庫（n8n 每天掃民生新聞評工具化/商機）＋Show HN 靈感', ready: true },
   { href: '/tools/memory-bot', title: '思念機器人', desc: '匯入真實 LINE 對話，跟「像那個人」的 AI 聊天（v0）', ready: true },
   { href: '/tools/werewolf', title: '狼人殺筆記', desc: '錄音自動轉逐字稿，AI 判狼＋賽後復盤，教訓越存越準', ready: true },
 ]
