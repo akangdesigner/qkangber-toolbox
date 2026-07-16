@@ -10,6 +10,7 @@ export type StockHealth = {
   price: number
   prevClose: number
   changePct: number // 當日漲跌幅 %
+  dataDate: string // 最後一根日K的台北日期 YYYY-MM-DD（資料新鮮度；訊號日誌用它判斷是否為今日交易資料）
   ma5: number
   ma20: number
   ma60: number
@@ -625,6 +626,14 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     else verdict = '訊號不一致，建議再等更明確的方向。'
   }
 
+  // 綠燈過熱降級（2026/06–07 回放：綠燈常亮在漲多高點，其中距季線>12% 的追進 5 日勝率僅約 26%）
+  // 綠燈只代表「結構偏多」，漲太遠就不是買點——降黃燈，避免把綠燈當買進鍵
+  const overheat = signal === 'green' && distMa60Pct > 12
+  if (overheat) {
+    signal = 'yellow'
+    verdict = `偏多但過熱：距季線已 +${round(distMa60Pct, 1)}%，多頭結構仍在但這裡不是買點，等回檔靠近季線再說。`
+  }
+
   // 進場時機判讀（照 SOP）：要做多就要「多頭 + 剛回檔沒噴太遠(距季線≤12%) + KD 降到低檔(≤50)」
   // 帶量突破：均線糾結末端，今日放量(量比≥1.3)收紅、且站上 5/20 短均 → 主力點火、起漲訊號
   const breakout = volRatio != null && volRatio >= 1.3 && dayUp && price > ma5 && price > ma20
@@ -643,8 +652,8 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     verdictFinal += `⚠️ 今日已大漲 ${chgToday}%，隔日追進約五成機率先回落 6% 以上再說（回測統計）——要進場請縮小部位，停損放在建議價 ${stopPrice}（-${stopPct}%）。`
   }
 
-  // 綜合評分：技術（含量價）+ 基本 + 籌碼
-  const techScore = Math.max(0, Math.min(100, scoreTechnical({ aboveMa60, arrange, macdHist: m.hist, kdCross, kdZone, entry }) + volAdj))
+  // 綜合評分：技術（含量價）+ 基本 + 籌碼；過熱（距季線>12%）扣 6 分
+  const techScore = Math.max(0, Math.min(100, scoreTechnical({ aboveMa60, arrange, macdHist: m.hist, kdCross, kdZone, entry }) + volAdj + (overheat ? -6 : 0)))
   const overall = scoreOverall(techScore, fund.score, chipScoreVal)
 
   return {
@@ -654,6 +663,7 @@ export async function analyzeStock(symbol: string): Promise<StockHealth | { symb
     price: round(price),
     prevClose: round(prevClose),
     changePct: chgToday,
+    dataDate: new Date(candles[last].time * 1000).toLocaleDateString('sv', { timeZone: 'Asia/Taipei' }),
     ma5: round(ma5),
     ma20: round(ma20),
     ma60: round(ma60),
@@ -720,6 +730,7 @@ export type MarketOverview = {
   mood: 'bullish' | 'neutral' | 'bearish'
   moodLabel: string // 環境偏多/中性/偏空
   moodText: string // 一句話總結
+  soxCorr20: number | null // 近20組「費半當日→加權隔日」相關係數（<0.25 視為脫鉤，費半警訊自動降權）
   asOf: string
 }
 
@@ -734,10 +745,12 @@ export async function getMarketOverview(): Promise<MarketOverview> {
     { key: 'vix', name: 'VIX 恐慌', ysym: '^VIX', ma: false },
   ]
   const indices: IndexQuote[] = []
+  const rawCandles: Record<string, Candle[]> = {} // 留住日K，給費半↔台股連動度計算用
   await Promise.all(
     defs.map(async (d) => {
       const r = await fetchYahoo(d.ysym).catch(() => null)
       if (!r || r.candles.length < 2) return
+      rawCandles[d.key] = r.candles
       const closes = r.candles.map((c) => c.close)
       const last = closes.length - 1
       const price = r.meta.regularMarketPrice ?? closes[last]
@@ -753,6 +766,32 @@ export async function getMarketOverview(): Promise<MarketOverview> {
 
   const get = (k: string) => indices.find((i) => i.key === k)
   const twii = get('twii'), sox = get('sox'), gspc = get('gspc'), vix = get('vix')
+
+  // 費半↔台股連動度：近 20 組「費半當日漲跌 → 加權下一交易日漲跌」的 Pearson 相關係數
+  // 2026/06–07 回放：脫鉤期費半跌>3% 後電子隔日僅 50% 收黑（遠低於長期統計的 85%），
+  // 所以費半規則不能寫死——連動度低（r<0.25）時警訊自動降權、強制 override 不啟動
+  let soxCorr20: number | null = null
+  const soxC = rawCandles['sox'], twiiC = rawCandles['twii']
+  if (soxC && twiiC && soxC.length > 25 && twiiC.length > 25) {
+    const xs: number[] = [], ys: number[] = []
+    for (let i = soxC.length - 1; i >= 1 && xs.length < 20; i--) {
+      const j = twiiC.findIndex((c) => c.time > soxC[i].time) // 費半該晚之後第一個台股交易日
+      if (j < 1) continue
+      xs.push(soxC[i].close / soxC[i - 1].close - 1)
+      ys.push(twiiC[j].close / twiiC[j - 1].close - 1)
+    }
+    if (xs.length >= 10) {
+      const n = xs.length
+      const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n
+      let sxy = 0, sxx = 0, syy = 0
+      for (let t = 0; t < n; t++) { const dx = xs[t] - mx, dy = ys[t] - my; sxy += dx * dy; sxx += dx * dx; syy += dy * dy }
+      if (sxx > 0 && syy > 0) soxCorr20 = round(sxy / Math.sqrt(sxx * syy), 2)
+    }
+  }
+  // 算不出連動度就當「有連動」（保守預設：寧可多警告，不要少警告）
+  const soxDecoupled = soxCorr20 != null && soxCorr20 < 0.25
+  const soxW = soxDecoupled ? 0.5 : 1
+
   let pts = 0
   if (twii) {
     pts += twii.aboveMa60 ? 2 : twii.aboveMa60 === false ? -2 : 0 // 趨勢：季線之上/之下
@@ -760,11 +799,11 @@ export async function getMarketOverview(): Promise<MarketOverview> {
     const p = twii.changePct
     pts += p >= 1.5 ? 2 : p > 0.3 ? 1 : p >= -0.3 ? 0 : p > -1.5 ? -1.5 : p > -3 ? -2.5 : -3.5
   }
-  // 費半對台股電子最關鍵，且要看「幅度」不能只看紅黑（回測近2年：費半跌0~1.5%→電子隔日平均+0.1%；
-  // 跌1.5~3%→平均-1.2%、76%收黑；跌逾3%→平均-2.2%、85%收黑，劑量效應非常明確）
+  // 費半對台股電子最關鍵，且要看「幅度」不能只看紅黑（回測近2年劑量效應明確：跌越深電子隔日越弱）
+  // 但 2026/06–07 回放發現脫鉤期會失靈，故乘上連動度權重 soxW（脫鉤時減半）
   if (sox) {
     const sp = sox.changePct
-    pts += sp > 0 ? 1.5 : sp > -1.5 ? -1 : sp > -3 ? -2.5 : -3.5
+    pts += (sp > 0 ? 1.5 : sp > -1.5 ? -1 : sp > -3 ? -2.5 : -3.5) * soxW
   }
   if (gspc) pts += gspc.changePct > 0 ? 0.5 : -0.5
   if (vix) {
@@ -776,8 +815,8 @@ export async function getMarketOverview(): Promise<MarketOverview> {
   const dayDrop = twii ? twii.changePct : 0
   if (dayDrop <= -2 && mood === 'bullish') mood = 'neutral'
   if (dayDrop <= -3) mood = 'bearish'
-  // 費半重挫日也不准喊順風（電子占台股權重太高，隔日 85% 機率電子收黑）
-  if (sox && sox.changePct <= -3 && mood === 'bullish') mood = 'neutral'
+  // 費半重挫日也不准喊順風（電子占台股權重太高）——但近期明顯脫鉤時不強制，避免一直誤擋
+  if (sox && sox.changePct <= -3 && mood === 'bullish' && !soxDecoupled) mood = 'neutral'
   const moodLabel = mood === 'bullish' ? '環境偏多' : mood === 'bearish' ? '環境偏空' : '環境中性'
   const reasons: string[] = []
   if (twii) {
@@ -786,8 +825,9 @@ export async function getMarketOverview(): Promise<MarketOverview> {
     else if (twii.changePct >= 2) reasons.push(`加權今日大漲 ${twii.changePct}%`)
   }
   if (sox) {
-    if (sox.changePct <= -3) reasons.push(`費半重挫 ${Math.abs(sox.changePct)}%——⚠️ 電子股今日避開（歷史上費半跌逾3%後，台股電子隔日 85% 收黑、平均 -2.2%）`)
-    else if (sox.changePct <= -1.5) reasons.push(`費半大跌 ${Math.abs(sox.changePct)}%，電子股保守`)
+    const corrNote = soxCorr20 == null ? '' : soxDecoupled ? `（近20日與台股連動偏低 r=${soxCorr20}，警訊參考就好）` : `（近20日連動度 r=${soxCorr20}）`
+    if (sox.changePct <= -3) reasons.push(`費半重挫 ${Math.abs(sox.changePct)}%——${soxDecoupled ? '電子股留意' : '⚠️ 電子股今日保守（歷史上費半重挫後，電子隔日明顯偏弱）'}${corrNote}`)
+    else if (sox.changePct <= -1.5) reasons.push(`費半大跌 ${Math.abs(sox.changePct)}%，電子股保守${corrNote}`)
     else reasons.push(sox.changePct >= 0 ? '費半收紅' : '費半收黑')
   }
   if (vix) reasons.push(vix.changePct >= 7 ? `VIX 跳升 ${vix.changePct}%` : vix.price < 16 ? 'VIX 平靜' : vix.price > 25 ? 'VIX 偏高' : 'VIX 中性')
@@ -795,7 +835,7 @@ export async function getMarketOverview(): Promise<MarketOverview> {
     (mood === 'bullish' ? '大環境順風，操作可積極些；' : mood === 'bearish' ? '大環境逆風，做多保守、控制部位、今天別追高；' : '大環境中性，個股表現為主，盤勢震盪別追高；') +
     reasons.join('、') + '。'
 
-  const data: MarketOverview = { indices, mood, moodLabel, moodText, asOf: new Date().toISOString() }
+  const data: MarketOverview = { indices, mood, moodLabel, moodText, soxCorr20, asOf: new Date().toISOString() }
   if (indices.length) marketCache = { data, at: Date.now() }
   return data
 }

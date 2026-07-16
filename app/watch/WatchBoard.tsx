@@ -9,7 +9,9 @@ const isErr = (r: Row): r is { symbol: string; error: string } => 'error' in r
 const STORE_KEY = 'qk-watchlist'
 const PAPER_KEY = 'qk-papertrades'
 const BUDGET_KEY = 'qk-paperbudget'
+const CAPITAL_KEY = 'qk-capital'
 const DEFAULT_BUDGET = 5000 // 模擬持股每檔預設投入金額（用來回推零股股數）
+const DEFAULT_CAPITAL = 100000 // 總資金：算「2% 風險部位上限」用
 const DEFAULT_LIST = ['2330', '0050', '2412']
 
 type PaperPos = { symbol: string; name: string; entryPrice: number; entryDate: string; stopPrice?: number } // stopPrice：買進當下記的停損價（舊資料沒有此欄）
@@ -112,6 +114,7 @@ export default function WatchBoard() {
   const [papers, setPapers] = useState<PaperPos[]>([]) // 模擬持股
   const [paperData, setPaperData] = useState<Row[]>([]) // 模擬持股的最新數據
   const [budget, setBudget] = useState(DEFAULT_BUDGET) // 每檔投入金額（估零股股數用）
+  const [capital, setCapital] = useState(DEFAULT_CAPITAL) // 總資金（2% 風險部位建議用）
   const [market, setMarket] = useState<MarketOverview | null>(null) // 大盤環境
   const [tradingNow, setTradingNow] = useState(false) // 是否台股盤中（client-only，避免 SSR 水合不一致）
 
@@ -123,6 +126,7 @@ export default function WatchBoard() {
       if (saved) list = JSON.parse(saved)
     } catch {}
     setSymbols(list)
+    syncList(list) // 開頁就同步一次清單到伺服器端，讓每日排程快照知道要記錄哪些股票
     if (list.length) fetchMany(list).then((r) => setRows(r))
 
     let plist: PaperPos[] = []
@@ -136,6 +140,8 @@ export default function WatchBoard() {
     try {
       const b = localStorage.getItem(BUDGET_KEY)
       if (b) setBudget(Number(b) || DEFAULT_BUDGET)
+      const c = localStorage.getItem(CAPITAL_KEY)
+      if (c) setCapital(Number(c) || DEFAULT_CAPITAL)
     } catch {}
 
     // 大盤環境（看天氣）
@@ -169,9 +175,21 @@ export default function WatchBoard() {
     localStorage.setItem(BUDGET_KEY, String(safe))
   }
 
+  function changeCapital(v: number) {
+    const safe = Number.isFinite(v) && v > 0 ? v : DEFAULT_CAPITAL
+    setCapital(safe)
+    localStorage.setItem(CAPITAL_KEY, String(safe))
+  }
+
   function persist(list: string[]) {
     setSymbols(list)
     localStorage.setItem(STORE_KEY, JSON.stringify(list))
+    syncList(list)
+  }
+
+  // 清單備份到伺服器端 data/watchlist.json（fire-and-forget）——scripts/snapshot.ts 每日排程靠它
+  function syncList(list: string[]) {
+    fetch('/api/watch/list', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbols: list }) }).catch(() => {})
   }
 
   async function fetchMany(list: string[]): Promise<Row[]> {
@@ -342,6 +360,10 @@ export default function WatchBoard() {
   }
   const heldSet = new Set(papers.map((p) => p.symbol))
 
+  // 逆風判定：mood 偏空「或」加權跌破季線就算（2y 回測：大盤在季線下時，高分股 20 日平均 -2%、
+  // 連「接近買點」都只剩 5 天反彈力——季線是硬條件，不是參考）
+  const headwind = market?.mood === 'bearish' || market?.indices?.find((i) => i.key === 'twii')?.aboveMa60 === false
+
   return (
     <main className="max-w-5xl mx-auto px-4 sm:px-6 py-12">
       <div className="mb-2 flex items-center justify-between gap-3">
@@ -397,6 +419,20 @@ export default function WatchBoard() {
           {scanning ? '掃描中…' : '🔍 AI 概念股（12 檔）'}
         </button>
       </div>
+
+      {/* 總資金：算「2% 風險部位上限」用（跌到停損價時虧損 ≈ 總資金的 2%） */}
+      <label className="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
+        💰 總資金
+        <input
+          type="number"
+          value={capital}
+          min={10000}
+          step={10000}
+          onChange={(e) => changeCapital(Number(e.target.value))}
+          className="w-28 rounded border border-white/10 bg-white/[0.04] px-2 py-1 text-right text-white focus:border-violet-400/50 focus:outline-none"
+        />
+        元——個股展開後會顯示「2% 風險部位上限」：買到上限、跌到停損價出場時，虧損約等於總資金的 2%
+      </label>
 
       {/* 選股結果列：進度、動作、分類篩選 */}
       {inScan && (() => {
@@ -562,9 +598,9 @@ export default function WatchBoard() {
               </div>
             )
           ) : inScan ? (
-            <StockCard key={r.symbol} s={r} mode="scan" inWatch={symbols.includes(r.symbol)} onAdd={() => addToWatch(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} bearish={market?.mood === 'bearish'} />
+            <StockCard key={r.symbol} s={r} mode="scan" inWatch={symbols.includes(r.symbol)} onAdd={() => addToWatch(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} bearish={headwind} capital={capital} />
           ) : (
-            <StockCard key={r.symbol} s={r} mode="watch" onRemove={() => removeSymbol(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} bearish={market?.mood === 'bearish'} />
+            <StockCard key={r.symbol} s={r} mode="watch" onRemove={() => removeSymbol(r.symbol)} onPaperBuy={() => paperBuy(r)} isHeld={heldSet.has(r.symbol)} bearish={headwind} capital={capital} />
           )
         )}
       </div>
@@ -622,7 +658,7 @@ function MarketBanner({ m }: { m: MarketOverview }) {
   )
 }
 
-function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld, bearish }: { s: StockHealth; mode: 'watch' | 'scan'; onRemove?: () => void; onAdd?: () => void; inWatch?: boolean; onPaperBuy?: () => void; isHeld?: boolean; bearish?: boolean }) {
+function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld, bearish, capital }: { s: StockHealth; mode: 'watch' | 'scan'; onRemove?: () => void; onAdd?: () => void; inWatch?: boolean; onPaperBuy?: () => void; isHeld?: boolean; bearish?: boolean; capital: number }) {
   const [open, setOpen] = useState(false) // 預設收合，點整列展開詳細
   const [chartMode, setChartMode] = useState<'line' | 'candle'>('line') // 走勢圖：折線 / K棒
   const st = signalStyle[s.signal]
@@ -693,7 +729,7 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld, bear
         </div>
         {bearish && bullishEntry && (
           <div className="mb-2 rounded-md border border-sky-500/30 bg-sky-500/[0.08] px-2.5 py-1.5 text-[11px] leading-relaxed text-sky-200">
-            🌧 大盤逆風期：就算這檔偏多，做多也<span className="font-medium">部位減半、寧可錯過</span>——逆風時飆股訊號最容易變陷阱。
+            🌧 大盤逆風（偏空或跌破季線）：<span className="font-medium">波段買進訊號此時失效，不進場</span>——2年回測：大盤在季線下時，高總分股 20 日平均轉負、連「接近買點」都只剩幾天反彈力。已持有的緊盯停損。
           </div>
         )}
         <div className="flex flex-wrap items-center gap-2">
@@ -712,6 +748,19 @@ function StockCard({ s, mode, onRemove, onAdd, inWatch, onPaperBuy, isHeld, bear
           <span className="inline-flex items-center rounded-md border border-rose-500/30 bg-rose-500/[0.06] px-2.5 py-1 text-xs font-medium text-rose-200" title={`停損距離依這檔的波動度推算（3.5×日均波動，夾5~15%）。回測：固定-6%停損有近半機率被日常雜訊掃出場，波動大的股票停損要放得更遠、部位相應縮小`}>
             🛑 建議停損 {s.stopPrice}（-{s.stopPct}%）
           </span>
+          {(() => {
+            // 2% 風險部位上限＝總資金×2% ÷ 停損距離%；停損越遠（越會跳的股票）能買越少
+            const maxPos = Math.min(capital, Math.round((capital * 2) / s.stopPct))
+            const shares = Math.floor(maxPos / s.price)
+            return (
+              <span
+                className="inline-flex items-center rounded-md border border-violet-500/30 bg-violet-500/[0.06] px-2.5 py-1 text-xs font-medium text-violet-200"
+                title={`2% 風險規則：部位上限＝總資金×2%÷停損距離。買滿 ${maxPos.toLocaleString()} 元、跌到停損價 ${s.stopPrice} 出場，虧損約 ${Math.round(capital * 0.02).toLocaleString()} 元（總資金 ${capital.toLocaleString()} 的 2%）`}
+              >
+                🎯 2%風險部位 ≤ {maxPos.toLocaleString()} 元{shares > 0 ? `（約 ${shares.toLocaleString()} 股）` : ''}
+              </span>
+            )
+          })()}
           {s.chipBothBuy && (
             <span className="inline-flex items-center rounded-md border border-fuchsia-500/50 bg-fuchsia-500/15 px-2.5 py-1 text-xs font-medium text-fuchsia-200" title="外資與投信最近交易日同步買超：極強短線領先訊號">
               🔥 外資投信同買
