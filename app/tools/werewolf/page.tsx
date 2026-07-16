@@ -4,14 +4,17 @@ import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 
 // ---- 型別（跟 lib/werewolf.ts 對齊）----
-type Seat = { id: string; claim?: string }
+type Seat = { id: string; player?: string; claim?: string }
 type Board = {
   players: number
   wolves: number
   roles: string
   seats: Seat[]
   note?: string
+  mySeat?: string // 我本人的座位（明身份）
+  myRole?: string
 }
+type RosterPlayer = { id: string; name: string; note?: string }
 type SeatVerdict = { seat: string; roleGuess: string; suspicion: number; reason: string }
 type Judgement = { seats: SeatVerdict[]; topWolves: string[]; overall: string; confidence: number }
 type Lesson = { id: string; ts: number; gameId?: string; title: string; insight: string }
@@ -28,7 +31,7 @@ type Game = {
   accuracy: number | null
 }
 
-const LS = { lessons: 'wn_lessons', games: 'wn_games', current: 'wn_current' }
+const LS = { lessons: 'wn_lessons', games: 'wn_games', current: 'wn_current', roster: 'wn_roster' }
 // 發言長度不固定（通常約兩分鐘）：切段主要靠「點發言者」手動切，
 // 這裡只是保險上限，避免單段過長
 const MAX_SEGMENT_MS = 150000
@@ -98,7 +101,7 @@ const PRESETS: { name: string; players: number; wolves: number; roles: string; n
 ]
 
 export default function WerewolfPage() {
-  const [tab, setTab] = useState<'game' | 'lessons' | 'history'>('game')
+  const [tab, setTab] = useState<'game' | 'roster' | 'lessons' | 'history'>('game')
 
   // 本局狀態
   const [board, setBoard] = useState<Board>(emptyBoard)
@@ -112,9 +115,11 @@ export default function WerewolfPage() {
   const [speaker, setSpeaker] = useState('')
   const speakerRef = useRef('')
 
-  // 教訓庫 / 歷史
+  // 教訓庫 / 歷史 / 玩家名冊
   const [lessons, setLessons] = useState<Lesson[]>([])
   const [games, setGames] = useState<Game[]>([])
+  const [roster, setRoster] = useState<RosterPlayer[]>([])
+  const [rosterInput, setRosterInput] = useState('')
 
   // 復盤
   const [truth, setTruth] = useState<Truth[]>([])
@@ -140,6 +145,7 @@ export default function WerewolfPage() {
   useEffect(() => {
     setLessons(load<Lesson[]>(LS.lessons, []))
     setGames(load<Game[]>(LS.games, []))
+    setRoster(load<RosterPlayer[]>(LS.roster, []))
     const cur = load<Partial<Game> | null>(LS.current, null)
     if (cur && cur.board) {
       setBoard(cur.board)
@@ -323,7 +329,8 @@ export default function WerewolfPage() {
 
   function computeAccuracy(): number | null {
     if (!judgement) return null
-    const actualWolves = truth.filter((t) => t.isWolf).map((t) => t.seat)
+    // 我自己的座位不算——AI 不判使用者本人
+    const actualWolves = truth.filter((t) => t.isWolf && t.seat !== board.mySeat).map((t) => t.seat)
     if (actualWolves.length === 0) return null
     const predicted = judgement.topWolves.slice(0, actualWolves.length)
     const hits = predicted.filter((p) => actualWolves.includes(p)).length
@@ -331,7 +338,12 @@ export default function WerewolfPage() {
   }
 
   async function runReflect() {
-    const filledTruth = board.seats.map((s) => truthFor(s.id))
+    const filledTruth = board.seats.map((s) => {
+      const t = truthFor(s.id)
+      // 我的座位自動帶入明身份
+      if (s.id === board.mySeat && !t.role && board.myRole) return { ...t, role: board.myRole }
+      return t
+    })
     if (!filledTruth.some((t) => t.isWolf)) {
       setError('復盤前先標出這局真正的狼是誰')
       return
@@ -414,7 +426,7 @@ export default function WerewolfPage() {
 
   // ---- 備份匯出/匯入 ----
   function exportBackup() {
-    const data = { lessons, games, exportedAt: Date.now() }
+    const data = { lessons, games, roster, exportedAt: Date.now() }
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -437,6 +449,10 @@ export default function WerewolfPage() {
         if (Array.isArray(data.games)) {
           setGames(data.games)
           save(LS.games, data.games)
+        }
+        if (Array.isArray(data.roster)) {
+          setRoster(data.roster)
+          save(LS.roster, data.roster)
         }
         alert('匯入完成')
       } catch {
@@ -472,7 +488,7 @@ export default function WerewolfPage() {
 
       {/* 分頁 */}
       <div className="flex gap-2 mb-6">
-        {([['game', '本局'], ['lessons', `教訓庫 ${lessons.length}`], ['history', `歷史 ${games.length}`]] as const).map(
+        {([['game', '本局'], ['roster', `名冊 ${roster.length}`], ['lessons', `教訓庫 ${lessons.length}`], ['history', `歷史 ${games.length}`]] as const).map(
           ([key, label]) => (
             <button
               key={key}
@@ -557,21 +573,65 @@ export default function WerewolfPage() {
                 style={inputStyle}
               />
             </label>
+            <div className="grid grid-cols-2 gap-3 mb-3 rounded-xl p-3" style={{ background: 'rgba(139,92,246,0.06)' }}>
+              <label className="text-sm text-slate-400">
+                ★ 我的座位
+                <select
+                  value={board.mySeat ?? ''}
+                  onChange={(e) => setBoard((b) => ({ ...b, mySeat: e.target.value || undefined }))}
+                  className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
+                  style={inputStyle}
+                >
+                  <option value="">（未設定）</option>
+                  {board.seats.map((s) => (
+                    <option key={s.id} value={s.id}>{s.id}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-sm text-slate-400">
+                我的真實身份（明牌給 AI 當推理起點）
+                <input
+                  value={board.myRole ?? ''}
+                  onChange={(e) => setBoard((b) => ({ ...b, myRole: e.target.value || undefined }))}
+                  placeholder="例：女巫"
+                  className="mt-1 w-full rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
+                  style={inputStyle}
+                />
+              </label>
+            </div>
             <div className="space-y-2">
-              <p className="text-xs text-slate-500">座位／玩家（自報身分可留白）</p>
+              <p className="text-xs text-slate-500">
+                座位／指派名冊玩家（教訓會綁定玩家跨局累積）／自報身分
+                {roster.length === 0 && (
+                  <button onClick={() => setTab('roster')} className="ml-2 text-violet-400 underline decoration-dotted">
+                    先去登記牌友 →
+                  </button>
+                )}
+              </p>
               {board.seats.map((s, i) => (
                 <div key={i} className="flex gap-2">
                   <input
                     value={s.id}
                     onChange={(e) => setSeat(i, { id: e.target.value })}
-                    className="w-24 rounded-lg px-3 py-2 text-white text-sm focus:outline-none"
+                    className={`w-16 rounded-lg px-2 py-2 text-sm focus:outline-none ${board.mySeat === s.id ? 'text-violet-300' : 'text-white'}`}
                     style={inputStyle}
                   />
+                  <select
+                    value={s.player ?? ''}
+                    onChange={(e) => setSeat(i, { player: e.target.value || undefined })}
+                    className="w-28 rounded-lg px-2 py-2 text-sm focus:outline-none"
+                    style={{ ...inputStyle, color: s.player ? '#c4b5fd' : '#64748b' }}
+                  >
+                    <option value="">（路人）</option>
+                    {roster.map((p) => (
+                      <option key={p.id} value={p.name}>{p.name}</option>
+                    ))}
+                  </select>
                   <input
                     value={s.claim ?? ''}
                     onChange={(e) => setSeat(i, { claim: e.target.value })}
-                    placeholder="自報身分（例：跳預言家）"
-                    className="flex-1 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
+                    placeholder="自報身分"
+                    className="flex-1 min-w-0 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
                     style={inputStyle}
                   />
                 </div>
@@ -660,7 +720,7 @@ export default function WerewolfPage() {
                           : { ...inputStyle, color: '#94a3b8' }
                       }
                     >
-                      {s.id}
+                      {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
                     </button>
                   ))}
                 </div>
@@ -786,7 +846,7 @@ export default function WerewolfPage() {
                     <input
                       value={t.role}
                       onChange={(e) => setTruthRole(s.id, e.target.value)}
-                      placeholder="真實身分"
+                      placeholder={s.id === board.mySeat && board.myRole ? `${board.myRole}（自動帶入）` : '真實身分'}
                       className="flex-1 rounded-lg px-3 py-1.5 text-white text-sm placeholder-slate-600 focus:outline-none"
                       style={inputStyle}
                     />
@@ -829,6 +889,76 @@ export default function WerewolfPage() {
               </div>
             )}
           </section>
+        </div>
+      )}
+
+      {/* ============ 玩家名冊 ============ */}
+      {tab === 'roster' && (
+        <div className="space-y-3">
+          <p className="text-sm text-slate-400">
+            登記固定牌友。開局時把人指派到座位，復盤的教訓會寫「這個人」的行為規律（不是座位號），跨局累積成行為檔案。
+          </p>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              const name = rosterInput.trim()
+              if (!name || roster.some((p) => p.name === name)) return
+              const next = [...roster, { id: uid(), name }]
+              setRoster(next)
+              save(LS.roster, next)
+              setRosterInput('')
+            }}
+            className="flex gap-2"
+          >
+            <input
+              value={rosterInput}
+              onChange={(e) => setRosterInput(e.target.value)}
+              placeholder="玩家名／綽號（例：阿明）"
+              className="flex-1 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
+              style={inputStyle}
+            />
+            <button type="submit" className="px-5 rounded-lg text-white text-sm font-medium" style={{ background: gradient }}>
+              登記
+            </button>
+          </form>
+          {roster.map((p) => {
+            // 跨局統計：出場數、當狼數、被 AI 抓中數
+            const played = games.filter((g) => g.board.seats.some((s) => s.player === p.name))
+            const wolfGames = played.filter((g) =>
+              g.truth?.some((t) => t.isWolf && g.board.seats.find((s) => s.id === t.seat)?.player === p.name),
+            )
+            const caught = wolfGames.filter((g) => {
+              const seat = g.board.seats.find((s) => s.player === p.name)
+              return seat && g.judgement?.topWolves.includes(seat.id)
+            })
+            const playerLessons = lessons.filter((l) => l.insight.includes(p.name) || l.title.includes(p.name))
+            return (
+              <div key={p.id} className="rounded-xl px-4 py-3" style={cardStyle}>
+                <div className="flex items-center justify-between">
+                  <span className="text-white font-medium">{p.name}</span>
+                  <button
+                    onClick={() => {
+                      const next = roster.filter((r) => r.id !== p.id)
+                      setRoster(next)
+                      save(LS.roster, next)
+                    }}
+                    className="text-xs text-slate-600 hover:text-red-400"
+                  >
+                    刪除
+                  </button>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  出場 {played.length} 局 ・ 當狼 {wolfGames.length} 次
+                  {wolfGames.length > 0 && ` ・ AI 抓中 ${caught.length}/${wolfGames.length}`}
+                  {playerLessons.length > 0 && ` ・ 相關教訓 ${playerLessons.length} 條`}
+                </p>
+                {playerLessons.slice(-2).map((l) => (
+                  <p key={l.id} className="text-xs text-violet-300/80 mt-1.5">📌 {l.insight}</p>
+                ))}
+              </div>
+            )
+          })}
+          {roster.length === 0 && <p className="text-center text-sm text-slate-600 mt-6">還沒登記任何牌友。</p>}
         </div>
       )}
 
