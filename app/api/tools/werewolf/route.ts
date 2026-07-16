@@ -6,7 +6,7 @@ import { transcribeAudio, transcribeWithTone, judge, reflect, takeNotes } from '
 // - action=judge：JSON { board, transcript, lessons } → 回判狼結果
 // - action=reflect：JSON { board, transcript, prediction, truth, result } → 回教訓
 
-export const maxDuration = 60 // 判狼/轉錄可能慢一點
+export const maxDuration = 120 // 雙世界並行分析＋裁判需要較長時間
 
 export async function POST(request: Request) {
   const contentType = request.headers.get('content-type') ?? ''

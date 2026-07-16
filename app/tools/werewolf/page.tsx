@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
+import { WEREWOLF_BLIND_TEST_2_EVENTS, WEREWOLF_BLIND_TEST_2_TRANSCRIPT } from '@/lib/werewolf-test-data'
 
 // ---- 型別（跟 lib/werewolf.ts 對齊）----
 type Seat = { id: string; player?: string; claim?: string; out?: boolean }
@@ -16,10 +17,42 @@ type Board = {
 }
 type RosterPlayer = { id: string; name: string; note?: string; isMe?: boolean }
 type SeatVerdict = { seat: string; roleGuess: string; suspicion: number; reason: string }
-type Judgement = { seats: SeatVerdict[]; topWolves: string[]; overall: string; confidence: number }
+type WorldAnalysis = {
+  assumedSeer: string
+  wolfPit: string[]
+  consistency: number
+  seats: { seat: string; suspicion: number; reason: string; goodAlternative: string }[]
+  hardContradictions: string[]
+  supportingEvidence: string[]
+  counterEvidence: string[]
+  summary: string
+}
+type Judgement = {
+  seats: SeatVerdict[]
+  topWolves: string[]
+  overall: string
+  confidence: number
+  worlds?: WorldAnalysis[]
+  selectedWorld?: string
+}
 type Lesson = { id: string; ts: number; gameId?: string; title: string; insight: string }
 type Truth = { seat: string; role: string; isWolf: boolean }
 type Phase = 'setup' | 'live' | 'review'
+type SpeechDirection = 'asc' | 'desc'
+type SheriffStage = 'speech' | 'vote' | 'runoffSpeech' | 'runoffVote' | 'deathReport' | 'daySetup' | 'daySpeech' | 'dayVote' | 'done'
+type LiveFlow = {
+  sheriffSeats: string[]
+  firstSpeaker: string
+  direction: SpeechDirection
+  ready: boolean
+  stage: SheriffStage
+  spokenSeats: string[]
+  votes: Record<string, string>
+  runoffCandidates: string[]
+  sheriffWinner: string
+  deathSeats: string[]
+  dayVotes: Record<string, string>
+}
 type Game = {
   id: string
   createdAt: number
@@ -33,7 +66,14 @@ type Game = {
   accuracy: number | null
 }
 
-const LS = { lessons: 'wn_lessons', games: 'wn_games', current: 'wn_current', roster: 'wn_roster' }
+const LS = {
+  lessons: 'wn_lessons',
+  games: 'wn_games',
+  current: 'wn_current',
+  roster: 'wn_roster',
+  staleTranscriptCleared: 'wn_stale_transcript_cleared_20260716',
+  blindTest2Seeded: 'wn_blind_test_2_seeded_20260716',
+}
 // 發言長度不固定（通常約兩分鐘）：切段主要靠「點發言者」手動切，
 // 這裡只是保險上限，避免單段過長
 const MAX_SEGMENT_MS = 150000
@@ -58,8 +98,42 @@ function save(key: string, val: unknown) {
 function makeSeats(n: number, prev: Seat[]): Seat[] {
   return Array.from({ length: n }, (_, i) => prev[i] ?? { id: `${i + 1}號` })
 }
+function speechPhaseLabel(stage: SheriffStage): string {
+  if (stage === 'speech') return '警上'
+  if (stage === 'runoffSpeech') return '警上 PK'
+  if (stage === 'daySpeech') return '第一天警下'
+  return '發言'
+}
+function speechesForSeat(transcript: string, seat: string): { phase: string; text: string }[] {
+  if (!seat) return []
+  return transcript
+    .split(/(?=^(?:【[^】]+】)?\d+號：)/m)
+    .map((block) => {
+      const tagged = block.match(/^【([^】]+)】(\d+號)：([\s\S]*)$/)
+      if (tagged) return { phase: tagged[1], seat: tagged[2], text: tagged[3].trim() }
+      const legacy = block.match(/^(\d+號)：([\s\S]*)$/)
+      return legacy ? { phase: '未分類', seat: legacy[1], text: legacy[2].trim() } : null
+    })
+    .filter((item): item is { phase: string; seat: string; text: string } => Boolean(item && item.seat === seat && item.text))
+    .map(({ phase, text }) => ({ phase, text }))
+}
 function emptyBoard(): Board {
   return { players: 12, wolves: 4, roles: '狼人x3、狼王、預言家、女巫、獵人、守衛、平民x4', seats: makeSeats(12, []), note: '' }
+}
+function emptyLiveFlow(): LiveFlow {
+  return {
+    sheriffSeats: [],
+    firstSpeaker: '',
+    direction: 'asc',
+    ready: false,
+    stage: 'speech',
+    spokenSeats: [],
+    votes: {},
+    runoffCandidates: [],
+    sheriffWinner: '',
+    deathSeats: [],
+    dayVotes: {},
+  }
 }
 
 // 常見 12 人板子預設。點了會覆蓋板子設定（座位指派保留可再編輯）。
@@ -102,17 +176,69 @@ const PRESETS: { name: string; players: number; wolves: number; roles: string; n
   },
 ]
 
+// 單一座位鈕（實戰畫面左右兩排用）。speak 模式點擊切換發言者；out 模式點擊標記出局。
+function SeatButton({
+  seat,
+  isMe,
+  active,
+  onClick,
+  gradient,
+  inputStyle,
+}: {
+  seat: Seat
+  isMe: boolean
+  active: boolean
+  onClick: () => void
+  gradient: string
+  inputStyle: React.CSSProperties
+}) {
+  const style: React.CSSProperties = seat.out
+    ? { background: 'rgba(255,255,255,0.02)', color: '#475569', border: '1px solid rgba(255,255,255,0.04)' }
+    : active
+      ? { background: gradient, color: '#fff' }
+      : { ...inputStyle, color: isMe ? '#c4b5fd' : '#e2e8f0' }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active || seat.out}
+      aria-label={`${seat.id}${seat.player ? ` ${seat.player}` : ''}${active ? '，正在發言' : ''}${seat.out ? '，已出局' : ''}`}
+      className={`relative min-h-14 rounded-xl px-2 py-2 text-left transition-all active:scale-95 ${active ? 'ring-2 ring-violet-300/70 shadow-lg shadow-violet-950/50' : ''}`}
+      style={{ ...style, opacity: seat.out ? 0.5 : 1 }}
+    >
+      {active && <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-400 animate-pulse" />}
+      <div className="flex items-center gap-1 text-sm font-semibold">
+        {seat.out && '💀'}
+        <span style={seat.out ? { textDecoration: 'line-through' } : undefined}>{seat.id}</span>
+        {isMe && <span className="text-xs">★</span>}
+      </div>
+      {seat.player && <div className="text-[11px] opacity-80 truncate">{seat.player}</div>}
+      {seat.claim && <div className="text-[11px] opacity-70 truncate">「{seat.claim}」</div>}
+    </button>
+  )
+}
+
 export default function WerewolfPage() {
+  const [hydrated, setHydrated] = useState(false)
   const [tab, setTab] = useState<'game' | 'roster' | 'lessons' | 'history'>('game')
   const [phase, setPhase] = useState<Phase>('setup')
 
   // 本局狀態
   const [board, setBoard] = useState<Board>(emptyBoard)
   const [transcript, setTranscript] = useState('')
+  const [transcriptDraft, setTranscriptDraft] = useState('')
+  const transcriptDraftRef = useRef('')
   const [events, setEvents] = useState<string[]>([]) // 戰況記錄：出局/票型/警長…
   const [eventInput, setEventInput] = useState('')
   const [notes, setNotes] = useState<string[]>([]) // AI 場邊筆記（逐段自動萃取）
   const notesRef = useRef<string[]>([])
+
+  // 實戰畫面：點座位的模式（發言切換/出局標記）、中間資訊流分頁
+  const [seatMode, setSeatMode] = useState<'speak' | 'out'>('speak')
+  const [feedTab, setFeedTab] = useState<'notes' | 'transcript' | 'events'>('notes')
+  const feedRef = useRef<HTMLDivElement | null>(null)
+  const [liveFlow, setLiveFlow] = useState<LiveFlow>(emptyLiveFlow)
   const [judgement, setJudgement] = useState<Judgement | null>(null)
   const [gameId, setGameId] = useState<string>(uid)
 
@@ -161,21 +287,72 @@ export default function WerewolfPage() {
     }
     const cur = load<(Partial<Game> & { phase?: Phase }) | null>(LS.current, null)
     if (cur && cur.board) {
-      setBoard(cur.board)
-      setTranscript(cur.transcript ?? '')
-      setEvents(cur.events ?? [])
-      setNotes(cur.notes ?? [])
-      notesRef.current = cur.notes ?? []
-      setJudgement(cur.judgement ?? null)
+      const shouldClearStaleTranscript = localStorage.getItem(LS.staleTranscriptCleared) !== '1'
+      const shouldSeedBlindTest = localStorage.getItem(LS.blindTest2Seeded) !== '1'
+      const seededBoard = shouldSeedBlindTest
+        ? { ...cur.board, seats: cur.board.seats.map((s) => ({ ...s, out: false })) }
+        : cur.board
+      setBoard(seededBoard)
+      setTranscript(shouldSeedBlindTest ? WEREWOLF_BLIND_TEST_2_TRANSCRIPT : shouldClearStaleTranscript ? '' : (cur.transcript ?? ''))
+      setEvents(shouldSeedBlindTest ? WEREWOLF_BLIND_TEST_2_EVENTS : (cur.events ?? []))
+      setNotes(shouldClearStaleTranscript || shouldSeedBlindTest ? [] : (cur.notes ?? []))
+      notesRef.current = shouldClearStaleTranscript || shouldSeedBlindTest ? [] : (cur.notes ?? [])
+      setJudgement(shouldClearStaleTranscript || shouldSeedBlindTest ? null : (cur.judgement ?? null))
+      const savedFlow = (cur as Partial<Game> & { liveFlow?: Partial<LiveFlow> }).liveFlow
+      setLiveFlow(shouldSeedBlindTest
+        ? {
+            ...emptyLiveFlow(),
+            ready: true,
+            stage: 'dayVote',
+            sheriffSeats: ['2號', '4號', '6號', '9號'],
+            firstSpeaker: '7號',
+            direction: 'asc',
+            sheriffWinner: '6號',
+            spokenSeats: seededBoard.seats.map((s) => s.id),
+          }
+        : { ...emptyLiveFlow(), ...savedFlow })
       setGameId(cur.id ?? uid())
-      setPhase(cur.phase ?? 'setup')
+      setPhase(shouldSeedBlindTest ? 'live' : (cur.phase ?? 'setup'))
+      if (shouldClearStaleTranscript) {
+        save(LS.current, { ...cur, transcript: '', notes: [], judgement: null })
+        localStorage.setItem(LS.staleTranscriptCleared, '1')
+      }
+      if (shouldSeedBlindTest) {
+        save(LS.current, {
+          ...cur,
+          board: seededBoard,
+          transcript: WEREWOLF_BLIND_TEST_2_TRANSCRIPT,
+          events: WEREWOLF_BLIND_TEST_2_EVENTS,
+          notes: [],
+          judgement: null,
+          phase: 'live',
+          liveFlow: {
+            ...emptyLiveFlow(),
+            ready: true,
+            stage: 'dayVote',
+            sheriffSeats: ['2號', '4號', '6號', '9號'],
+            firstSpeaker: '7號',
+            direction: 'asc',
+            sheriffWinner: '6號',
+            spokenSeats: seededBoard.seats.map((s) => s.id),
+          },
+        })
+        localStorage.setItem(LS.blindTest2Seeded, '1')
+      }
     }
+    setHydrated(true)
   }, [])
 
   // ---- 自動存本局進度 ----
   useEffect(() => {
-    save(LS.current, { id: gameId, board, transcript, events, notes, judgement, phase })
-  }, [gameId, board, transcript, events, notes, judgement, phase])
+    if (!hydrated) return
+    save(LS.current, { id: gameId, board, transcript, events, notes, judgement, phase, liveFlow })
+  }, [hydrated, gameId, board, transcript, events, notes, judgement, phase, liveFlow])
+
+  // ---- 資訊流有新內容就自動捲到底 ----
+  useEffect(() => {
+    if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight
+  }, [notes, events, feedTab])
 
   // ---- 「阿康之神」指派到哪格，那格就是我的座位 ----
   useEffect(() => {
@@ -191,6 +368,12 @@ export default function WerewolfPage() {
   }
   function setSeat(i: number, patch: Partial<Seat>) {
     setBoard((b) => ({ ...b, seats: b.seats.map((s, idx) => (idx === i ? { ...s, ...patch } : s)) }))
+  }
+  function addEvent(text: string) {
+    const value = text.trim()
+    if (!value) return
+    setEvents((prev) => [...prev, value])
+    setEventInput('')
   }
   function applyPreset(p: (typeof PRESETS)[number]) {
     setBoard((b) => ({
@@ -239,6 +422,7 @@ export default function WerewolfPage() {
     const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
     recorderRef.current = rec
     const segSpeaker = speakerRef.current // 這一段開始時的發言者
+    const segPhase = speechPhaseLabel(liveFlow.stage)
     const chunks: Blob[] = []
     rec.ondataavailable = (e) => {
       if (e.data.size > 0) chunks.push(e.data)
@@ -246,7 +430,7 @@ export default function WerewolfPage() {
     rec.onstop = async () => {
       const blob = new Blob(chunks, { type: mime || 'audio/webm' })
       if (recordingRef.current) recordSegment() // 先無縫接下一段，轉錄慢慢跑
-      if (blob.size > 1000) await sendForTranscription(blob, segSpeaker)
+      if (blob.size > 1000) await sendForTranscription(blob, segSpeaker, segPhase)
     }
     rec.start()
     // 保險上限：單段太長就自動切（發言者不變）
@@ -257,12 +441,197 @@ export default function WerewolfPage() {
 
   // 換人發言：點座位 → 切掉當前段（掛上一位的名字）、開新段（掛新發言者）
   function switchSpeaker(next: string) {
+    const previous = speakerRef.current
+    if (previous && previous !== next) commitTranscriptDraft(previous)
     const same = speakerRef.current === next
     speakerRef.current = same ? '' : next // 再點一次同座位 = 取消掛名
     setSpeaker(speakerRef.current)
     if (recording && recorderRef.current && recorderRef.current.state !== 'inactive') {
       recorderRef.current.stop() // onstop 會自動開新段（用新的 speakerRef）
     }
+  }
+
+  function commitTranscriptDraft(seat = speakerRef.current) {
+    const text = transcriptDraftRef.current.trim()
+    if (!seat || !text) return
+    const entry = `【${speechPhaseLabel(liveFlow.stage)}】${seat}：${text}`
+    setTranscript((current) => current ? `${current}\n${entry}` : entry)
+    void autoTakeNotes(entry)
+    transcriptDraftRef.current = ''
+    setTranscriptDraft('')
+  }
+
+  function nextSpeaker() {
+    const candidateIds = liveFlow.stage === 'daySpeech'
+      ? board.seats.map((s) => s.id)
+      : liveFlow.stage === 'runoffSpeech'
+        ? liveFlow.runoffCandidates
+        : liveFlow.sheriffSeats
+    const available = board.seats.filter((s) => !s.out && candidateIds.includes(s.id))
+    if (!available.length) return
+    const justSpoken = speakerRef.current
+    commitTranscriptDraft(justSpoken)
+    const spoken = Array.from(new Set([...liveFlow.spokenSeats, justSpoken].filter(Boolean)))
+    if (available.every((s) => spoken.includes(s.id))) {
+      if (recording) stopRecording()
+      speakerRef.current = ''
+      setSpeaker('')
+      if (liveFlow.stage === 'daySpeech') {
+        setEvents((prev) => [...prev, '警長指定發言輪次完成'])
+        setLiveFlow((flow) => ({ ...flow, spokenSeats: spoken, stage: 'dayVote', dayVotes: {} }))
+        return
+      }
+      setLiveFlow((flow) => ({
+        ...flow,
+        spokenSeats: spoken,
+        votes: {},
+        stage: flow.stage === 'runoffSpeech' ? 'runoffVote' : 'vote',
+      }))
+      setFeedTab('events')
+      return
+    }
+    const currentIndex = available.findIndex((s) => s.id === justSpoken)
+    const step = liveFlow.direction === 'asc' ? 1 : -1
+    let nextIndex = currentIndex
+    do {
+      nextIndex = nextIndex < 0
+        ? Math.max(0, available.findIndex((s) => s.id === liveFlow.firstSpeaker))
+        : (nextIndex + step + available.length) % available.length
+    } while (spoken.includes(available[nextIndex].id))
+    setLiveFlow((flow) => ({ ...flow, spokenSeats: spoken }))
+    switchSpeaker(available[nextIndex].id)
+    if (!recording) void startRecording()
+  }
+
+  function setSheriffVote(voter: string, target: string) {
+    setLiveFlow((flow) => ({ ...flow, votes: { ...flow.votes, [voter]: target } }))
+  }
+
+  async function finishSheriffVote() {
+    const candidates = liveFlow.stage === 'runoffVote' ? liveFlow.runoffCandidates : liveFlow.sheriffSeats
+    const counts = Object.values(liveFlow.votes).reduce<Record<string, number>>((acc, target) => {
+      if (target !== '棄票') acc[target] = (acc[target] ?? 0) + 1
+      return acc
+    }, {})
+    const maxVotes = Math.max(0, ...candidates.map((id) => counts[id] ?? 0))
+    const leaders = candidates.filter((id) => (counts[id] ?? 0) === maxVotes && maxVotes > 0)
+    const roundLabel = liveFlow.stage === 'runoffVote' ? '警長第二輪票型' : '警長第一輪票型'
+    const voteLine = board.seats
+      .filter((s) => liveFlow.votes[s.id])
+      .map((s) => `${s.id}→${liveFlow.votes[s.id]}`)
+      .join('、')
+    setEvents((prev) => [...prev, `${roundLabel}：${voteLine || '無投票紀錄'}`])
+
+    if (leaders.length > 1) {
+      const ordered = board.seats.filter((s) => leaders.includes(s.id)).map((s) => s.id)
+      if (liveFlow.direction === 'desc') ordered.reverse()
+      const first = ordered[0]
+      setEvents((prev) => [...prev, `警長平票：${leaders.join('、')}，進入PK發言`])
+      setLiveFlow((flow) => ({
+        ...flow,
+        stage: 'runoffSpeech',
+        runoffCandidates: leaders,
+        spokenSeats: [],
+        votes: {},
+        firstSpeaker: first,
+      }))
+      speakerRef.current = first
+      setSpeaker(first)
+      setSeatMode('speak')
+      if (!recording) await startRecording()
+      return
+    }
+
+    const winner = leaders[0]
+    setEvents((prev) => [...prev, winner ? `警長當選：${winner}` : '警長投票：無人當選'])
+    setLiveFlow((flow) => ({ ...flow, stage: winner ? 'deathReport' : 'done', sheriffWinner: winner ?? '', votes: {}, firstSpeaker: '', spokenSeats: [], deathSeats: [] }))
+  }
+
+  function confirmDeathReport(safeNight: boolean) {
+    if (!safeNight && liveFlow.deathSeats.length === 0) {
+      setError('請勾選倒牌玩家，或選擇平安夜')
+      return
+    }
+    setError('')
+    if (safeNight) {
+      setEvents((prev) => [...prev, '昨夜死訊：平安夜'])
+    } else {
+      setEvents((prev) => [...prev, `昨夜死訊：${liveFlow.deathSeats.join('、')}倒牌`])
+      setBoard((b) => ({
+        ...b,
+        seats: b.seats.map((s) => liveFlow.deathSeats.includes(s.id) ? { ...s, out: true } : s),
+      }))
+    }
+    setLiveFlow((flow) => ({ ...flow, stage: 'daySetup', firstSpeaker: '' }))
+  }
+
+  async function beginDaySpeech() {
+    const alive = board.seats.filter((s) => !s.out)
+    const sheriffIndex = alive.findIndex((s) => s.id === liveFlow.sheriffWinner)
+    if (sheriffIndex < 0 || alive.length < 2) {
+      setError('警長已出局，或場上沒有足夠的存活玩家')
+      return
+    }
+    const step = liveFlow.direction === 'asc' ? 1 : -1
+    const firstSpeaker = alive[(sheriffIndex + step + alive.length) % alive.length].id
+    setEvents((prev) => [
+      ...prev,
+      `警長${liveFlow.sheriffWinner}指定：${liveFlow.direction === 'asc' ? '警右' : '警左'}開始，${firstSpeaker}首位發言`,
+    ])
+    setLiveFlow((flow) => ({ ...flow, stage: 'daySpeech', spokenSeats: [], firstSpeaker }))
+    speakerRef.current = firstSpeaker
+    setSpeaker(firstSpeaker)
+    setSeatMode('speak')
+    if (!recording) await startRecording()
+  }
+
+  function setDayVote(voter: string, target: string) {
+    setLiveFlow((flow) => ({ ...flow, dayVotes: { ...flow.dayVotes, [voter]: target } }))
+  }
+
+  function finishDayVote() {
+    const alive = board.seats.filter((s) => !s.out)
+    const counts = Object.entries(liveFlow.dayVotes).reduce<Record<string, number>>((acc, [voter, target]) => {
+      if (target !== '棄票') acc[target] = (acc[target] ?? 0) + (voter === liveFlow.sheriffWinner ? 1.5 : 1)
+      return acc
+    }, {})
+    const maxVotes = Math.max(0, ...alive.map((s) => counts[s.id] ?? 0))
+    const leaders = alive.filter((s) => (counts[s.id] ?? 0) === maxVotes && maxVotes > 0).map((s) => s.id)
+    const voteLine = alive
+      .filter((s) => liveFlow.dayVotes[s.id])
+      .map((s) => `${s.id}${s.id === liveFlow.sheriffWinner ? '(警長)' : ''}→${liveFlow.dayVotes[s.id]}`)
+      .join('、')
+    const result = leaders.length === 1
+      ? `${leaders[0]}放逐出局（${maxVotes}票）`
+      : leaders.length > 1
+        ? `${leaders.join('、')}平票（${maxVotes}票）`
+        : '無人被放逐'
+    setEvents((prev) => [...prev, `第一天放逐票型：${voteLine || '無投票紀錄'}`, `第一天放逐結果：${result}`])
+    if (leaders.length === 1) {
+      setBoard((b) => ({ ...b, seats: b.seats.map((s) => s.id === leaders[0] ? { ...s, out: true } : s) }))
+    }
+    setLiveFlow((flow) => ({ ...flow, stage: 'done' }))
+  }
+
+  async function beginLiveFlow() {
+    if (!liveFlow.firstSpeaker) {
+      setError('請先選擇首位發言者')
+      return
+    }
+    const sheriffEvent = liveFlow.sheriffSeats.length
+      ? `上警名單：${liveFlow.sheriffSeats.join('、')}`
+      : '上警名單：無人上警'
+    const orderEvent = `首位發言：${liveFlow.firstSpeaker}，${liveFlow.direction === 'asc' ? '順序' : '逆序'}發言`
+    setEvents((prev) => [
+      ...prev.filter((e) => !e.startsWith('上警名單：') && !e.startsWith('首位發言：')),
+      sheriffEvent,
+      orderEvent,
+    ])
+    setLiveFlow((flow) => ({ ...flow, ready: true, stage: 'speech', spokenSeats: [], votes: {}, runoffCandidates: [], sheriffWinner: '', deathSeats: [], dayVotes: {} }))
+    speakerRef.current = liveFlow.firstSpeaker
+    setSpeaker(liveFlow.firstSpeaker)
+    setSeatMode('speak')
+    if (!recording) await startRecording()
   }
 
   function stopRecording() {
@@ -273,7 +642,7 @@ export default function WerewolfPage() {
     streamRef.current = null
   }
 
-  async function sendForTranscription(blob: Blob, segSpeaker?: string) {
+  async function sendForTranscription(blob: Blob, segSpeaker?: string, segPhase = speechPhaseLabel(liveFlow.stage)) {
     setTranscribing(true)
     setError('')
     try {
@@ -286,7 +655,7 @@ export default function WerewolfPage() {
       const text = (json.text ?? '').trim()
       if (text) {
         // 有指定發言者 → 自動掛名
-        const entry = segSpeaker ? `${segSpeaker}：${text}` : text
+        const entry = segSpeaker ? `【${segPhase}】${segSpeaker}：${text}` : text
         setTranscript((t) => (t ? t + '\n' + entry : entry))
         void autoTakeNotes(entry) // AI 背景做筆記，不擋轉錄
       }
@@ -458,6 +827,8 @@ export default function WerewolfPage() {
     if (recording) stopRecording()
     setBoard(emptyBoard())
     setTranscript('')
+    setTranscriptDraft('')
+    transcriptDraftRef.current = ''
     setEvents([])
     setEventInput('')
     setNotes([])
@@ -469,6 +840,7 @@ export default function WerewolfPage() {
     setGameId(uid())
     setSpeaker('')
     speakerRef.current = ''
+    setLiveFlow(emptyLiveFlow())
     setPhase('setup')
   }
 
@@ -533,7 +905,7 @@ export default function WerewolfPage() {
   const gradient = 'linear-gradient(135deg, #6366f1, #8b5cf6)'
 
   return (
-    <main className="relative max-w-2xl mx-auto px-4 sm:px-6 py-8">
+    <main className={`relative mx-auto px-3 sm:px-6 py-5 sm:py-8 transition-[max-width] ${tab === 'game' && phase === 'live' ? 'max-w-5xl' : 'max-w-2xl'}`}>
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl sm:text-3xl font-semibold text-white tracking-[-0.02em]">狼人殺筆記</h1>
         <Link href="/" className="text-sm text-slate-400 hover:text-slate-200">← 回工具箱</Link>
@@ -726,8 +1098,325 @@ export default function WerewolfPage() {
           {/* ======== 階段二：實戰 ======== */}
           {phase === 'live' && (
             <>
-              {/* 錄音控制 */}
-              <section className="rounded-2xl p-4" style={cardStyle}>
+              {!liveFlow.ready ? (
+                <section className="rounded-2xl p-4 sm:p-5" style={{ ...cardStyle, border: '1px solid rgba(139,92,246,0.28)' }}>
+                  <div className="mb-5">
+                    <p className="text-xs font-medium text-violet-300">實戰開始前</p>
+                    <h2 className="mt-1 text-lg font-semibold text-white">設定本輪發言流程</h2>
+                    <p className="mt-1 text-xs text-slate-500">完成後會從首位發言者開始錄音，之後只要按「下一位」。</p>
+                  </div>
+
+                  <div className="mb-5">
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-sm font-medium text-slate-200">1. 上警名單</p>
+                      <button
+                        type="button"
+                        onClick={() => setLiveFlow((f) => ({ ...f, sheriffSeats: f.sheriffSeats.length === board.seats.length ? [] : board.seats.map((s) => s.id) }))}
+                        className="text-xs text-slate-500 hover:text-slate-300"
+                      >
+                        {liveFlow.sheriffSeats.length === board.seats.length ? '全部取消' : '全部選取'}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-4 sm:grid-cols-6 gap-1.5">
+                      {board.seats.map((s) => {
+                        const selected = liveFlow.sheriffSeats.includes(s.id)
+                        return (
+                          <button
+                            key={s.id}
+                            type="button"
+                            onClick={() => setLiveFlow((f) => ({
+                              ...f,
+                              sheriffSeats: selected ? f.sheriffSeats.filter((id) => id !== s.id) : [...f.sheriffSeats, s.id],
+                            }))}
+                            className="rounded-lg px-2 py-2 text-xs font-medium transition-colors"
+                            style={selected ? { background: gradient, color: '#fff' } : { ...inputStyle, color: '#94a3b8' }}
+                          >
+                            {s.id}{selected ? ' ✓' : ''}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <label className="text-sm font-medium text-slate-200">
+                      2. 首位發言者
+                      <select
+                        value={liveFlow.firstSpeaker}
+                        onChange={(e) => setLiveFlow((f) => ({ ...f, firstSpeaker: e.target.value }))}
+                        className="mt-2 w-full rounded-lg px-3 py-2.5 text-sm focus:outline-none"
+                        style={{ ...inputStyle, color: liveFlow.firstSpeaker ? '#fff' : '#64748b' }}
+                      >
+                        <option value="">請選座位</option>
+                        {board.seats.filter((s) => liveFlow.sheriffSeats.includes(s.id)).map((s) => <option key={s.id} value={s.id}>{s.id}{s.player ? `・${s.player}` : ''}</option>)}
+                      </select>
+                    </label>
+
+                    <div>
+                      <p className="text-sm font-medium text-slate-200">3. 發言順序</p>
+                      <div className="mt-2 grid grid-cols-2 overflow-hidden rounded-lg" style={inputStyle}>
+                        {([['asc', '順序 →'], ['desc', '逆序 ←']] as const).map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            onClick={() => setLiveFlow((f) => ({ ...f, direction: value }))}
+                            className="px-3 py-2.5 text-sm"
+                            style={liveFlow.direction === value ? { background: gradient, color: '#fff' } : { color: '#94a3b8' }}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={beginLiveFlow}
+                    className="mt-5 w-full rounded-full py-3 text-sm font-semibold text-white disabled:opacity-40"
+                    style={{ background: gradient }}
+                    disabled={!liveFlow.firstSpeaker || !liveFlow.sheriffSeats.includes(liveFlow.firstSpeaker)}
+                  >
+                    開始錄音・{liveFlow.firstSpeaker || '首位'}發言 →
+                  </button>
+                </section>
+              ) : (
+                <section className="sticky top-2 z-20 rounded-2xl p-3 shadow-2xl shadow-slate-950/70 backdrop-blur-xl" style={{ background: 'rgba(15,17,32,0.94)', border: '1px solid rgba(139,92,246,0.35)' }}>
+                  {(liveFlow.stage === 'speech' || liveFlow.stage === 'runoffSpeech' || liveFlow.stage === 'daySpeech') ? <div className="flex items-center gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[10px] text-slate-500">
+                        {liveFlow.stage === 'daySpeech' ? `警長 ${liveFlow.sheriffWinner} 指定發言` : liveFlow.stage === 'runoffSpeech' ? '平票 PK 發言' : '警上發言'}
+                      </p>
+                      <p className="truncate text-lg font-semibold text-white">🎙 {speaker || liveFlow.firstSpeaker}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (recording) stopRecording()
+                        setLiveFlow((f) => ({ ...f, ready: false }))
+                      }}
+                      className="shrink-0 text-xs text-slate-500 hover:text-white"
+                    >
+                      修改流程
+                    </button>
+                    <button
+                      type="button"
+                      onClick={nextSpeaker}
+                      className="shrink-0 rounded-full px-5 py-2.5 text-sm font-semibold text-white active:scale-95"
+                      style={{ background: gradient }}
+                    >
+                      下一位 {liveFlow.direction === 'asc' ? '→' : '←'}
+                    </button>
+                  </div> : (
+                    <div className="flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[10px] text-slate-500">警長競選</p>
+                        <p className="truncate text-base font-semibold text-white">
+                          {liveFlow.stage === 'done' ? '✓ 第一天投票完成' : liveFlow.stage === 'dayVote' ? '第一天放逐票型登記' : liveFlow.stage === 'deathReport' ? '等待宣布昨夜死訊' : liveFlow.stage === 'daySetup' ? `警長 ${liveFlow.sheriffWinner} 指定發言順序` : liveFlow.stage === 'runoffVote' ? '第二輪票型登記' : '第一輪票型登記'}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </section>
+              )}
+
+              {(liveFlow.stage === 'vote' || liveFlow.stage === 'runoffVote') && (
+                <section className="rounded-2xl p-4 sm:p-5" style={{ ...cardStyle, border: '1px solid rgba(245,158,11,0.25)' }}>
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-medium text-amber-300">{liveFlow.stage === 'runoffVote' ? '第二輪投票' : '警長投票'}</p>
+                      <h2 className="mt-1 text-lg font-semibold text-white">登記誰投給誰</h2>
+                      <p className="mt-1 text-xs text-slate-500">警上玩家不投票；每位警下玩家選候選人或棄票。</p>
+                    </div>
+                    <span className="shrink-0 rounded-full px-2.5 py-1 text-xs text-slate-400" style={inputStyle}>
+                      已記 {Object.keys(liveFlow.votes).length}/{board.seats.filter((s) => !liveFlow.sheriffSeats.includes(s.id) && !s.out).length}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {board.seats.filter((s) => !liveFlow.sheriffSeats.includes(s.id) && !s.out).map((voter) => {
+                      const candidates = liveFlow.stage === 'runoffVote' ? liveFlow.runoffCandidates : liveFlow.sheriffSeats
+                      return (
+                        <div key={voter.id} className="flex items-center gap-2">
+                          <span className="w-12 shrink-0 text-sm font-medium text-white">{voter.id}</span>
+                          <div className="flex flex-1 gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none]">
+                            {[...candidates, '棄票'].map((target) => (
+                              <button
+                                key={target}
+                                type="button"
+                                onClick={() => setSheriffVote(voter.id, target)}
+                                className="shrink-0 rounded-lg px-3 py-2 text-xs font-medium"
+                                style={liveFlow.votes[voter.id] === target
+                                  ? target === '棄票'
+                                    ? { background: 'rgba(100,116,139,.35)', color: '#fff', border: '1px solid rgba(148,163,184,.4)' }
+                                    : { background: gradient, color: '#fff' }
+                                  : { ...inputStyle, color: '#94a3b8' }}
+                              >
+                                {target === '棄票' ? target : `投 ${target}`}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => void finishSheriffVote()}
+                    className="mt-5 w-full rounded-full py-3 text-sm font-semibold text-white disabled:opacity-40"
+                    style={{ background: 'linear-gradient(135deg,#d97706,#f59e0b)' }}
+                    disabled={Object.keys(liveFlow.votes).length === 0}
+                  >
+                    完成計票
+                  </button>
+                </section>
+              )}
+
+              {liveFlow.stage === 'deathReport' && (
+                <section className="rounded-2xl p-4 sm:p-5" style={{ ...cardStyle, border: '1px solid rgba(239,68,68,0.25)' }}>
+                  <div className="mb-4">
+                    <p className="text-xs font-medium text-red-300">警長 {liveFlow.sheriffWinner} 已當選</p>
+                    <h2 className="mt-1 text-lg font-semibold text-white">宣布昨夜死訊</h2>
+                    <p className="mt-1 text-xs text-slate-500">選擇平安夜，或勾選所有倒牌玩家；倒牌者會自動標記出局。</p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => confirmDeathReport(true)}
+                    className="mb-4 w-full rounded-xl py-3 text-sm font-semibold text-emerald-300"
+                    style={{ background: 'rgba(34,197,94,.09)', border: '1px solid rgba(34,197,94,.22)' }}
+                  >
+                    ☀️ 平安夜・無人倒牌
+                  </button>
+
+                  <p className="mb-2 text-xs font-medium text-slate-400">或勾選倒牌玩家</p>
+                  <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-6">
+                    {board.seats.filter((s) => !s.out).map((s) => {
+                      const selected = liveFlow.deathSeats.includes(s.id)
+                      return (
+                        <button
+                          key={s.id}
+                          type="button"
+                          onClick={() => setLiveFlow((flow) => ({
+                            ...flow,
+                            deathSeats: selected ? flow.deathSeats.filter((id) => id !== s.id) : [...flow.deathSeats, s.id],
+                          }))}
+                          className="rounded-lg px-2 py-2.5 text-xs font-medium"
+                          style={selected
+                            ? { background: 'linear-gradient(135deg,#dc2626,#f97316)', color: '#fff' }
+                            : { ...inputStyle, color: '#94a3b8' }}
+                        >
+                          {selected ? '💀 ' : ''}{s.id}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => confirmDeathReport(false)}
+                    disabled={liveFlow.deathSeats.length === 0}
+                    className="mt-4 w-full rounded-full py-3 text-sm font-semibold text-white disabled:opacity-40"
+                    style={{ background: 'linear-gradient(135deg,#dc2626,#f97316)' }}
+                  >
+                    確認死訊{liveFlow.deathSeats.length ? `・${liveFlow.deathSeats.join('、')}倒牌` : ''}
+                  </button>
+                </section>
+              )}
+
+              {liveFlow.stage === 'daySetup' && (
+                <section className="rounded-2xl p-4 sm:p-5" style={{ ...cardStyle, border: '1px solid rgba(34,197,94,0.25)' }}>
+                  <div className="mb-5">
+                    <p className="text-xs font-medium text-emerald-300">警長 {liveFlow.sheriffWinner} 已拿到警徽</p>
+                    <h2 className="mt-1 text-lg font-semibold text-white">登記警長指定的發言順序</h2>
+                    <p className="mt-1 text-xs text-slate-500">選擇警左或警右開始；系統會從警長相鄰的存活玩家開始錄音，倒牌者自動跳過。</p>
+                  </div>
+
+                  <div>
+                    <p className="text-sm font-medium text-slate-200">警長指定</p>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      {([['desc', '← 警左開始'], ['asc', '警右開始 →']] as const).map(([value, label]) => (
+                        <button
+                          key={value}
+                          type="button"
+                          onClick={() => setLiveFlow((f) => ({ ...f, direction: value }))}
+                          className="rounded-xl px-3 py-4 text-sm font-semibold"
+                          style={liveFlow.direction === value ? { background: gradient, color: '#fff' } : { ...inputStyle, color: '#94a3b8' }}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => void beginDaySpeech()}
+                    className="mt-5 w-full rounded-full py-3 text-sm font-semibold text-white disabled:opacity-40"
+                    style={{ background: 'linear-gradient(135deg,#059669,#22c55e)' }}
+                  >
+                    開始{liveFlow.direction === 'asc' ? '警右' : '警左'}發言錄音 →
+                  </button>
+                </section>
+              )}
+
+              {liveFlow.stage === 'dayVote' && (
+                <section className="rounded-2xl p-4 sm:p-5" style={{ ...cardStyle, border: '1px solid rgba(239,68,68,0.25)' }}>
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-medium text-red-300">第一天白天</p>
+                      <h2 className="mt-1 text-lg font-semibold text-white">登記放逐票型</h2>
+                      <p className="mt-1 text-xs text-slate-500">逐一登記存活玩家投給誰；警長票會自動按 1.5 票計算。</p>
+                    </div>
+                    <span className="shrink-0 rounded-full px-2.5 py-1 text-xs text-slate-400" style={inputStyle}>
+                      已記 {Object.keys(liveFlow.dayVotes).length}/{board.seats.filter((s) => !s.out).length}
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {board.seats.filter((s) => !s.out).map((voter) => (
+                      <div key={voter.id} className="flex items-center gap-2">
+                        <span className={`w-16 shrink-0 text-sm font-medium ${voter.id === liveFlow.sheriffWinner ? 'text-amber-300' : 'text-white'}`}>
+                          {voter.id}{voter.id === liveFlow.sheriffWinner ? ' ♛' : ''}
+                        </span>
+                        <div className="flex flex-1 gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none]">
+                          {[...board.seats.filter((s) => !s.out).map((s) => s.id), '棄票'].map((target) => (
+                            <button
+                              key={target}
+                              type="button"
+                              onClick={() => setDayVote(voter.id, target)}
+                              className="shrink-0 rounded-lg px-3 py-2 text-xs font-medium"
+                              style={liveFlow.dayVotes[voter.id] === target
+                                ? target === '棄票'
+                                  ? { background: 'rgba(100,116,139,.35)', color: '#fff', border: '1px solid rgba(148,163,184,.4)' }
+                                  : { background: 'linear-gradient(135deg,#dc2626,#f97316)', color: '#fff' }
+                                : { ...inputStyle, color: '#94a3b8' }}
+                            >
+                              {target === '棄票' ? target : `投 ${target}`}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={finishDayVote}
+                    disabled={Object.keys(liveFlow.dayVotes).length === 0}
+                    className="mt-5 w-full rounded-full py-3 text-sm font-semibold text-white disabled:opacity-40"
+                    style={{ background: 'linear-gradient(135deg,#dc2626,#f97316)' }}
+                  >
+                    完成第一天投票・開始 AI 判狼
+                  </button>
+                </section>
+              )}
+
+              {liveFlow.ready && (liveFlow.stage === 'speech' || liveFlow.stage === 'runoffSpeech' || liveFlow.stage === 'daySpeech') && (
+                <>
+              {/* 錄音控制（只在發言階段顯示） */}
+              <section className="rounded-2xl p-3" style={cardStyle}>
                 <div className="flex flex-wrap gap-2 items-center">
                   <div className="flex rounded-full overflow-hidden text-xs" style={inputStyle}>
                     {(['mic', 'tab'] as const).map((m) => (
@@ -738,7 +1427,7 @@ export default function WerewolfPage() {
                         className="px-3 py-1.5"
                         style={recMode === m ? { background: gradient, color: '#fff' } : { color: '#94a3b8' }}
                       >
-                        {m === 'mic' ? '🎤 麥克風' : '💻 分頁內錄'}
+                        {m === 'mic' ? '🎤' : '💻'}
                       </button>
                     ))}
                   </div>
@@ -777,154 +1466,224 @@ export default function WerewolfPage() {
                     }
                     title="開啟時音檔交給 Gemini 聽，逐字稿會自動標語氣（停頓/遲疑/笑…）；關閉時走 whisper 純文字"
                   >
-                    {toneMode ? '🎭 語氣 開' : '語氣 關'}
+                    {toneMode ? '🎭 語氣' : '語氣關'}
                   </button>
+                  <span className="ml-auto text-xs text-slate-500">存活 {aliveCount}/{board.players}</span>
                   {recording && <span className="text-xs text-red-400 animate-pulse">● 錄音中</span>}
                   {transcribing && <span className="text-xs text-violet-300">轉錄中…</span>}
                 </div>
-
-                {/* 發言者切換：永遠顯示在錄音控制下方 */}
-                <div className="mt-3 rounded-xl p-3" style={{ background: 'rgba(139,92,246,0.06)' }}>
-                  <p className="text-xs text-slate-400 mb-2">
-                    誰在發言？換人時點座位 → 上一段自動轉錄掛名（再點同座位＝取消）
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {board.seats.map((s) => (
-                      <button
-                        key={s.id}
-                        onClick={() => switchSpeaker(s.id)}
-                        className="px-3 py-1.5 rounded-full text-xs font-medium"
-                        style={
-                          speaker === s.id
-                            ? { background: gradient, color: '#fff' }
-                            : s.out
-                              ? { background: 'rgba(255,255,255,0.02)', color: '#475569', textDecoration: 'line-through' }
-                              : { ...inputStyle, color: '#94a3b8' }
-                        }
-                      >
-                        {s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
-                      </button>
-                    ))}
-                  </div>
-                  {speaker && <p className="text-xs text-violet-300 mt-2">🎙 現在發言：{speaker}</p>}
-                </div>
               </section>
 
-              {/* 場上狀態：出局標記 */}
-              <section className="rounded-2xl p-4" style={cardStyle}>
-                <div className="flex items-center justify-between mb-2">
-                  <h2 className="text-white font-medium">場上狀態</h2>
-                  <span className="text-xs text-slate-500">存活 {aliveCount}/{board.players}</span>
-                </div>
-                <p className="text-xs text-slate-500 mb-3">出局點一下座位（再點復活）</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {board.seats.map((s, i) => (
-                    <button
-                      key={s.id}
-                      onClick={() => setSeat(i, { out: !s.out })}
-                      className="px-3 py-1.5 rounded-full text-xs font-medium"
-                      style={
-                        s.out
-                          ? { background: 'rgba(239,68,68,0.12)', color: '#f87171', border: '1px solid rgba(239,68,68,0.25)', textDecoration: 'line-through' }
-                          : { ...inputStyle, color: board.mySeat === s.id ? '#c4b5fd' : '#94a3b8' }
-                      }
-                    >
-                      {s.out ? '💀' : ''}{s.id}{s.player ? `·${s.player}` : ''}{board.mySeat === s.id ? '★' : ''}
-                    </button>
-                  ))}
-                </div>
-              </section>
-
-              {/* AI 場邊筆記 */}
-              <section className="rounded-2xl p-4" style={cardStyle}>
-                <div className="flex items-center justify-between mb-2">
-                  <h2 className="text-white font-medium">🗒 AI 場邊筆記</h2>
-                  <span className="text-xs text-slate-500">{notes.length} 條</span>
-                </div>
-                <p className="text-xs text-slate-500 mb-3">
-                  每段發言轉錄完 AI 自動記：跳身分、查殺宣稱、質疑、站邊、矛盾…判狼時全部帶入。記錯可刪。
-                </p>
-                {notes.length === 0 ? (
-                  <p className="text-sm text-slate-600">開始錄音後筆記會自動長出來。</p>
-                ) : (
-                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
-                    {notes.map((n, i) => (
-                      <div key={i} className="flex items-start gap-2 rounded-lg px-3 py-1.5 text-sm" style={inputStyle}>
-                        <span className="flex-1 text-slate-300">{n}</span>
-                        <button
-                          onClick={() => {
-                            notesRef.current = notesRef.current.filter((_, idx) => idx !== i)
-                            setNotes(notesRef.current)
-                          }}
-                          className="text-xs text-slate-600 hover:text-red-400 shrink-0"
-                        >
-                          刪
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
-
-              {/* 逐字稿 */}
-              <section className="rounded-2xl p-4" style={cardStyle}>
-                <h2 className="text-white font-medium mb-3">逐字稿</h2>
-                <textarea
-                  value={transcript}
-                  onChange={(e) => setTranscript(e.target.value)}
-                  placeholder={'錄音轉出的文字會自動長在這裡（含發言者掛名與語氣標註），可隨時手動修改補充。'}
-                  rows={8}
-                  className="w-full rounded-lg px-3 py-3 text-white text-sm placeholder-slate-600 focus:outline-none font-mono leading-relaxed"
-                  style={inputStyle}
-                />
-              </section>
-
-              {/* 戰況記錄 */}
-              <section className="rounded-2xl p-4" style={cardStyle}>
-                <h2 className="text-white font-medium mb-1">戰況記錄</h2>
-                <p className="text-xs text-slate-500 mb-3">
-                  回報硬資訊：夜間死訊、警上陣容、退水、警長歸屬、票型…判狼時優先度比發言高。
-                </p>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault()
-                    const t = eventInput.trim()
-                    if (!t) return
-                    setEvents((prev) => [...prev, t])
-                    setEventInput('')
-                  }}
-                  className="flex gap-2 mb-3"
-                >
-                  <input
-                    value={eventInput}
-                    onChange={(e) => setEventInput(e.target.value)}
-                    placeholder="例：首夜5號倒牌／警上2,4,8；8退水／票型1,3,7投5"
-                    className="flex-1 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-600 focus:outline-none"
-                    style={inputStyle}
-                  />
-                  <button type="submit" className="px-4 rounded-lg text-white text-sm font-medium" style={{ background: gradient }}>
-                    記錄
+              {/* 座位模式切換 */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-500">點座位：</span>
+                <div className="flex rounded-full overflow-hidden text-xs" style={inputStyle}>
+                  <button
+                    onClick={() => setSeatMode('speak')}
+                    className="px-3 py-1.5"
+                    style={seatMode === 'speak' ? { background: gradient, color: '#fff' } : { color: '#94a3b8' }}
+                  >
+                    🎙 切換發言者
                   </button>
-                </form>
-                {events.length > 0 && (
-                  <div className="space-y-1.5">
-                    {events.map((ev, i) => (
-                      <div key={i} className="flex items-start gap-2 rounded-lg px-3 py-2 text-sm" style={inputStyle}>
-                        <span className="text-slate-500 text-xs shrink-0 mt-0.5">{i + 1}.</span>
-                        <span className="flex-1 text-slate-300">{ev}</span>
-                        <button
-                          onClick={() => setEvents((prev) => prev.filter((_, idx) => idx !== i))}
-                          className="text-xs text-slate-600 hover:text-red-400 shrink-0"
-                        >
-                          刪
-                        </button>
-                      </div>
+                  <button
+                    onClick={() => setSeatMode('out')}
+                    className="px-3 py-1.5"
+                    style={seatMode === 'out' ? { background: 'linear-gradient(135deg,#ef4444,#f97316)', color: '#fff' } : { color: '#94a3b8' }}
+                  >
+                    💀 標記出局
+                  </button>
+                </div>
+                {speaker && seatMode === 'speak' && <span className="text-xs text-violet-300">現在發言：{speaker}</span>}
+              </div>
+
+              {/* 遊戲桌面：左右座位＋中間資訊流（照網易狼人殺實戰畫面排版） */}
+              <section className="rounded-2xl p-2 sm:p-3" style={cardStyle}>
+                <div className="grid grid-cols-[minmax(72px,1fr)_minmax(148px,2.4fr)_minmax(72px,1fr)] gap-1.5 sm:gap-3">
+                  {/* 左：1-6 號 */}
+                  <div className="flex flex-col gap-1.5">
+                    {board.seats.slice(0, 6).map((s, idx) => (
+                      <SeatButton
+                        key={s.id}
+                        seat={s}
+                        isMe={board.mySeat === s.id}
+                        active={seatMode === 'speak' && speaker === s.id}
+                        onClick={() => (seatMode === 'speak' ? switchSpeaker(s.id) : setSeat(idx, { out: !s.out }))}
+                        gradient={gradient}
+                        inputStyle={inputStyle}
+                      />
                     ))}
                   </div>
-                )}
-              </section>
 
-              {/* 判狼 */}
+                  {/* 中：資訊流 */}
+                  <div className="rounded-xl flex flex-col h-[25rem] sm:h-[30rem] min-w-0 overflow-hidden" style={{ background: 'rgba(0,0,0,0.2)' }}>
+                    <div className="flex text-xs shrink-0">
+                      {(
+                        [
+                          ['notes', `🗒 筆記 ${notes.length}`],
+                          ['transcript', '逐字稿'],
+                          ['events', `戰況 ${events.length}`],
+                        ] as const
+                      ).map(([k, label]) => (
+                        <button
+                          key={k}
+                          onClick={() => setFeedTab(k)}
+                            className="flex-1 min-w-0 py-2 px-1 font-medium truncate"
+                          style={
+                            feedTab === k
+                              ? { background: 'rgba(139,92,246,0.15)', color: '#c4b5fd', borderBottom: '2px solid #8b5cf6' }
+                              : { color: '#64748b' }
+                          }
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div ref={feedRef} className="flex-1 overflow-y-auto p-2 space-y-1.5">
+                      {feedTab === 'notes' && (
+                        notes.length === 0 ? (
+                          <p className="text-xs text-slate-600 text-center mt-6">開始錄音後 AI 筆記會自動長出來</p>
+                        ) : (
+                          notes.map((n, i) => (
+                            <div key={i} className="flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-xs" style={inputStyle}>
+                              <span className="flex-1 text-slate-300 leading-relaxed">{n}</span>
+                              <button
+                                onClick={() => {
+                                  notesRef.current = notesRef.current.filter((_, idx) => idx !== i)
+                                  setNotes(notesRef.current)
+                                }}
+                                className="text-slate-600 hover:text-red-400 shrink-0"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ))
+                        )
+                      )}
+
+                      {feedTab === 'transcript' && (
+                        speaker ? (
+                          <div className="flex h-full min-h-[18rem] flex-col gap-2">
+                            <div className="flex items-center justify-between px-1">
+                              <p className="text-xs font-semibold text-violet-300">{speaker}・{speechPhaseLabel(liveFlow.stage)}</p>
+                              <span className="text-[10px] text-slate-600">切換下一位時自動存入</span>
+                            </div>
+
+                            {speechesForSeat(transcript, speaker).length > 0 && (
+                              <div className="max-h-36 space-y-1.5 overflow-y-auto rounded-lg p-2" style={inputStyle}>
+                                {speechesForSeat(transcript, speaker).map((speech, index) => (
+                                  <div key={index} className="text-xs leading-relaxed text-slate-400">
+                                    <span className="mr-1 rounded bg-violet-500/10 px-1.5 py-0.5 text-[10px] text-violet-300">{speech.phase}</span>
+                                    {speech.text}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            <textarea
+                              value={transcriptDraft}
+                              onChange={(e) => {
+                                transcriptDraftRef.current = e.target.value
+                                setTranscriptDraft(e.target.value)
+                              }}
+                              placeholder={`只貼${speaker}的「${speechPhaseLabel(liveFlow.stage)}」發言；按「下一位」會自動存檔。`}
+                              className="min-h-32 flex-1 resize-none rounded-lg px-2.5 py-2 text-xs leading-relaxed text-white placeholder-slate-600 focus:outline-none font-mono"
+                              style={{ background: 'rgba(255,255,255,.025)', border: '1px solid rgba(255,255,255,.06)' }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => commitTranscriptDraft(speaker)}
+                              disabled={!transcriptDraft.trim()}
+                              className="rounded-lg py-2 text-xs font-medium text-white disabled:opacity-30"
+                              style={{ background: gradient }}
+                            >
+                              存入 {speaker}・{speechPhaseLabel(liveFlow.stage)}
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="mt-8 text-center text-xs text-slate-600">先點一個座位，再貼該玩家的獨立發言稿</p>
+                        )
+                      )}
+
+                      {feedTab === 'events' && (
+                        <>
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault()
+                              const t = eventInput.trim()
+                              if (!t) return
+                              addEvent(t)
+                            }}
+                            className="flex gap-1 mb-1.5"
+                          >
+                            <input
+                              value={eventInput}
+                              onChange={(e) => setEventInput(e.target.value)}
+                              placeholder="死訊／票型／警長…"
+                              className="flex-1 min-w-0 rounded-lg px-2 py-1.5 text-white text-xs placeholder-slate-600 focus:outline-none"
+                              style={inputStyle}
+                            />
+                            <button type="submit" className="px-2.5 rounded-lg text-white text-xs font-medium shrink-0" style={{ background: gradient }}>
+                              記
+                            </button>
+                          </form>
+                          {eventInput && (
+                            <p className="mb-1.5 text-[10px] text-slate-600">補完內容後按「記」，會連同類型一起存入。</p>
+                          )}
+                          {events.length === 0 ? (
+                            <p className="text-xs text-slate-600 text-center mt-6">回報死訊/票型/警長歸屬…判狼時優先度比發言高</p>
+                          ) : (
+                            events.map((ev, i) => (
+                              <div key={i} className="flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-xs" style={inputStyle}>
+                                <span className="text-slate-500 shrink-0">{i + 1}.</span>
+                                <span className="flex-1 text-slate-300">{ev}</span>
+                                <button
+                                  onClick={() => setEvents((prev) => prev.filter((_, idx) => idx !== i))}
+                                  className="text-slate-600 hover:text-red-400 shrink-0"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            ))
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* 右：7-12 號 */}
+                  <div className="flex flex-col gap-1.5">
+                    {board.seats.slice(6, 12).map((s, idx) => (
+                      <SeatButton
+                        key={s.id}
+                        seat={s}
+                        isMe={board.mySeat === s.id}
+                        active={seatMode === 'speak' && speaker === s.id}
+                        onClick={() => (seatMode === 'speak' ? switchSpeaker(s.id) : setSeat(idx + 6, { out: !s.out }))}
+                        gradient={gradient}
+                        inputStyle={inputStyle}
+                      />
+                    ))}
+                    {/* 13 人以上的座位（少見）放右欄下方 */}
+                    {board.seats.slice(12).map((s, idx) => (
+                      <SeatButton
+                        key={s.id}
+                        seat={s}
+                        isMe={board.mySeat === s.id}
+                        active={seatMode === 'speak' && speaker === s.id}
+                        onClick={() => (seatMode === 'speak' ? switchSpeaker(s.id) : setSeat(idx + 12, { out: !s.out }))}
+                        gradient={gradient}
+                        inputStyle={inputStyle}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </section>
+                </>
+              )}
+
+              {liveFlow.stage === 'done' && <>
+              {/* 第一天白天投票完成後才開放判狼 */}
               <section className="rounded-2xl p-4" style={cardStyle}>
                 <div className="flex items-center justify-between mb-3">
                   <h2 className="text-white font-medium">AI 判狼</h2>
@@ -939,9 +1698,42 @@ export default function WerewolfPage() {
                 </div>
                 {judgement && (
                   <div className="space-y-3">
+                    {judgement.worlds && judgement.worlds.length === 2 && (
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        {judgement.worlds.map((world) => {
+                          const selected = judgement.selectedWorld === world.assumedSeer
+                          return (
+                            <div
+                              key={world.assumedSeer}
+                              className="rounded-xl p-3"
+                              style={selected
+                                ? { background: 'rgba(139,92,246,.12)', border: '1px solid rgba(139,92,246,.4)' }
+                                : { ...inputStyle, opacity: .82 }}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <p className="text-sm font-semibold text-white">假設 {world.assumedSeer} 真預言家</p>
+                                <span className={`text-xs ${selected ? 'text-violet-300' : 'text-slate-500'}`}>
+                                  自洽 {world.consistency}{selected ? '・採用' : ''}
+                                </span>
+                              </div>
+                              <p className="mt-2 text-xs text-red-300">🐺 {world.wolfPit.join('、') || '未形成狼坑'}</p>
+                              <p className="mt-2 text-xs leading-relaxed text-slate-400">{world.summary}</p>
+                              {world.hardContradictions.length > 0 && (
+                                <div className="mt-2 border-t border-white/5 pt-2">
+                                  <p className="mb-1 text-[10px] text-amber-300">此世界硬矛盾</p>
+                                  {world.hardContradictions.slice(0, 3).map((item, index) => (
+                                    <p key={index} className="text-[11px] leading-relaxed text-slate-500">• {item}</p>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
                     <div className="rounded-lg p-3" style={{ background: 'rgba(139,92,246,0.08)' }}>
-                      <p className="text-xs text-violet-300 mb-1">最可疑的狼（把握 {judgement.confidence}%）</p>
-                      <p className="text-white font-medium">🐺 {judgement.topWolves.join('、') || '—'}</p>
+                      <p className="text-xs text-violet-300 mb-1">有足夠證據的疑狼名單（把握 {judgement.confidence}%）</p>
+                      <p className="text-white font-medium">🐺 {judgement.topWolves.join('、') || '目前證據不足，不硬點狼'}</p>
                       <p className="text-sm text-slate-300 mt-2">{judgement.overall}</p>
                     </div>
                     <div className="space-y-1.5">
@@ -976,6 +1768,7 @@ export default function WerewolfPage() {
               >
                 對局結束，進入復盤 →
               </button>
+              </>}
             </>
           )}
 
