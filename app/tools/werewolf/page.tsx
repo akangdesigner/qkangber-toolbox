@@ -91,7 +91,7 @@ const LS = {
 }
 // 發言長度不固定（通常約兩分鐘）：切段主要靠「點發言者」手動切，
 // 這裡只是保險上限，避免單段過長
-const MAX_SEGMENT_MS = 150000
+const MAX_SEGMENT_MS = 30000 // 同一人講超過 30 秒自動切段送轉錄，逐字稿邊講邊長，不用等換人
 
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -287,6 +287,12 @@ export default function WerewolfPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const recorderRef = useRef<MediaRecorder | null>(null)
 
+  // 音量指示＋空段提示（確認麥克風真的有收到聲音）
+  const [micLevel, setMicLevel] = useState(0)
+  const [emptyHint, setEmptyHint] = useState(false)
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const levelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   // ---- 載入 localStorage ----
   useEffect(() => {
     setLessons(load<Lesson[]>(LS.lessons, []))
@@ -422,6 +428,7 @@ export default function WerewolfPage() {
       streamRef.current = stream
       recordingRef.current = true
       setRecording(true)
+      startLevelMeter(stream)
       recordSegment()
     } catch (err) {
       setError(err instanceof Error ? err.message : '無法開始錄音（可能是權限被拒）')
@@ -655,6 +662,38 @@ export default function WerewolfPage() {
     if (recorderRef.current && recorderRef.current.state !== 'inactive') recorderRef.current.stop()
     streamRef.current?.getTracks().forEach((t) => t.stop())
     streamRef.current = null
+    stopLevelMeter()
+  }
+
+  // 音量表：從錄音串流取 RMS，畫成小條——一眼看出麥克風有沒有在收音（失敗不影響錄音）
+  function startLevelMeter(stream: MediaStream) {
+    try {
+      const ctx = new AudioContext()
+      audioCtxRef.current = ctx
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 512
+      ctx.createMediaStreamSource(stream).connect(analyser)
+      const buf = new Uint8Array(analyser.frequencyBinCount)
+      levelTimerRef.current = setInterval(() => {
+        analyser.getByteTimeDomainData(buf)
+        let sum = 0
+        for (let i = 0; i < buf.length; i++) {
+          const d = (buf[i] - 128) / 128
+          sum += d * d
+        }
+        setMicLevel(Math.min(100, Math.round(Math.sqrt(sum / buf.length) * 300)))
+      }, 120)
+    } catch {}
+  }
+
+  function stopLevelMeter() {
+    if (levelTimerRef.current) {
+      clearInterval(levelTimerRef.current)
+      levelTimerRef.current = null
+    }
+    audioCtxRef.current?.close().catch(() => {})
+    audioCtxRef.current = null
+    setMicLevel(0)
   }
 
   async function sendForTranscription(blob: Blob, segSpeaker?: string, segPhase = speechPhaseLabel(liveFlow.stage)) {
@@ -669,10 +708,13 @@ export default function WerewolfPage() {
       if (!res.ok) throw new Error(json.error ?? '轉錄失敗')
       const text = (json.text ?? '').trim()
       if (text) {
+        setEmptyHint(false)
         // 有指定發言者 → 自動掛名
         const entry = segSpeaker ? `【${segPhase}】${segSpeaker}：${text}` : text
         setTranscript((t) => (t ? t + '\n' + entry : entry))
         void autoTakeNotes(entry) // AI 背景做筆記，不擋轉錄
+      } else {
+        setEmptyHint(true) // 轉出空字串以前是靜默消失，使用者以為沒在錄——現在明著提示
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : '轉錄失敗')
@@ -1484,8 +1526,24 @@ export default function WerewolfPage() {
                     {toneMode ? '🎭 語氣' : '語氣關'}
                   </button>
                   <span className="ml-auto text-xs text-slate-500">存活 {aliveCount}/{board.players}</span>
-                  {recording && <span className="text-xs text-red-400 animate-pulse">● 錄音中</span>}
+                  {recording && (
+                    <span className="flex items-center gap-1.5 text-xs text-red-400">
+                      <span className="animate-pulse">●</span>
+                      <span
+                        className="inline-block h-1.5 w-16 overflow-hidden rounded-full bg-white/10"
+                        title="音量表：講話時綠條要跳動，不動代表麥克風沒收到聲音"
+                      >
+                        <span
+                          className="block h-full rounded-full transition-all duration-150"
+                          style={{ width: `${micLevel}%`, background: micLevel > 8 ? '#34d399' : '#64748b' }}
+                        />
+                      </span>
+                    </span>
+                  )}
                   {transcribing && <span className="text-xs text-violet-300">轉錄中…</span>}
+                  {emptyHint && !transcribing && (
+                    <span className="text-xs text-amber-400">⚠️ 上一段沒轉出文字——確認音量表有在跳、聲音夠大</span>
+                  )}
                 </div>
               </section>
 
