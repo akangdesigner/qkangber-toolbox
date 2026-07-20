@@ -6,6 +6,7 @@ import Link from 'next/link'
 type Idea = {
   title: string
   titleZh: string
+  summary: string
   note: string
   url: string
   hnUrl: string
@@ -229,7 +230,7 @@ function ShowHNTab() {
 
   return (
     <div>
-      <p className="text-slate-400 mb-6">抓 Hacker News 上的 Show HN，看獨立開發者都在做什麼小工具，AI 順手翻成中文＋補一句延伸靈感。</p>
+      <p className="text-slate-400 mb-6">抓 Hacker News 上的 Show HN，看獨立開發者都在做什麼小工具。AI 讀作者自述寫成中文摘要，不點原文也知道他做了什麼，再補一句延伸靈感。</p>
 
       <form onSubmit={handleSearch} className="flex gap-2 mb-8">
         <input
@@ -268,6 +269,7 @@ function ShowHNTab() {
           >
             <h2 className="text-white font-medium mb-1">{idea.titleZh}</h2>
             <p className="text-xs text-slate-500 mb-2">{idea.title}</p>
+            {idea.summary && <p className="text-sm text-slate-300 leading-relaxed mb-3">{idea.summary}</p>}
             {idea.note && <p className="text-sm text-violet-300 mb-3">💡 {idea.note}</p>}
             <div className="flex items-center gap-4 text-xs text-slate-500">
               <span>▲ {idea.points}</span>

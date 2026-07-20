@@ -17,6 +17,7 @@ type HNHit = {
 type Idea = {
   title: string
   titleZh: string
+  summary: string
   note: string
   url: string
   hnUrl: string
@@ -134,7 +135,7 @@ async function gatherMaterials(hits: HNHit[]): Promise<Material[]> {
 async function translateAndAnnotate(
   hits: HNHit[],
   materials: Material[]
-): Promise<{ titleZh: string; note: string }[]> {
+): Promise<{ titleZh: string; summary: string; note: string }[]> {
   const client = getGroqClient()
   const list = hits
     .map((h, i) => {
@@ -146,7 +147,8 @@ async function translateAndAnnotate(
     .join('\n')
   const completion = await client.chat.completions.create({
     model: GROQ_MODEL,
-    max_tokens: 2500,
+    // 每則多了 60–100 字摘要，24 則的中文輸出遠超原本 2500 的額度，不夠會被截斷成殘缺 JSON
+    max_tokens: 8000,
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -154,11 +156,16 @@ async function translateAndAnnotate(
         content: `你幫台灣的獨立開發者/創業者整理 Hacker News 上的 Show HN 產品清單，激發創業靈感。
 
 對輸入的每一項，輸出：
-- titleZh：用繁體中文具體說明「這個產品在做什麼、給誰用」，25–45 字，像跟朋友介紹一個東西，不是把標題直翻成新聞標題。有附「網站簡介」或「作者自述」時一定要根據那些內容寫（兩個都有就一起參考，作者自述通常更清楚講出它在解決什麼問題）；兩者都沒有才憑標題合理推測，但不要瞎掰不存在的功能或數字。
+- titleZh：一句話講這個東西是什麼，15–25 字，像產品的中文小標。簡潔就好，細節留給 summary，不要塞滿功能描述。
+- summary：60–100 字的繁體中文摘要，讓人不點進原文也知道作者到底做了什麼。照這個順序寫：作者做了什麼東西、他想解決的問題是什麼、怎麼做到的（用了什麼方法或技術）。有「作者自述」時以它為主（那是作者本人的說法），「網站簡介」拿來補。分成 1–2 句，講事實不要評價。
 - note：一句完整的話（15–40 字），講這個點子搬到台灣的某個具體場景會變成什麼。必須指名道姓：哪一種人、在什麼場合、原本是怎麼處理這件事的。寫完自問「這句話換到另一則產品上還成立嗎」，如果成立就是太空泛，重寫。
 
-titleZh 範例（照這個具體程度寫，不要只是翻譯標題）：
-- 標題 "Show HN: Bunkr – open-source file manager" ｜ 網站簡介 "Self-hosted alternative to Google Drive with end-to-end encryption" → titleZh: "可以自己架的雲端硬碟，檔案端對端加密，取代 Google Drive"
+沒有附「網站簡介」也沒有「作者自述」的項目，summary 一律給空字串——寧可留白也不要憑標題編造作者做了什麼。這種情況 titleZh 照標題合理翻譯就好。
+
+titleZh 和 summary 的範例（注意標題短、細節在摘要）：
+- 標題 "Show HN: Bunkr – open-source file manager" ｜ 網站簡介 "Self-hosted alternative to Google Drive with end-to-end encryption"
+  → titleZh: "可以自己架的加密雲端硬碟"
+  → summary: "作者做了一套可以架在自己主機上的檔案管理工具，用來取代 Google Drive。他想解決的是檔案放在別人雲端、隱私不在自己手上的問題，做法是檔案端對端加密，只有自己拿得到金鑰。"
 
 note 範例（重點是指名道姓的場景和「原本怎麼做」，不是市場評語）：
 - 原題 "CouponHunt – Product Hunt for Coupons" → note: "團媽現在靠 LINE 群組轉發優惠碼，做成能搜尋的站就省事了"
@@ -171,15 +178,21 @@ note 嚴禁這幾種寫法（這是最常見的失敗模式）：
 - 只把 titleZh 換個詞重講一遍
 
 只回傳 JSON object，順序要跟輸入完全一致：
-{"items":[{"titleZh":"...","note":"..."}, ...]}`,
+{"items":[{"titleZh":"...","summary":"...","note":"..."}, ...]}`,
       },
       { role: 'user', content: list },
     ],
   })
   const raw = completion.choices[0]?.message?.content ?? '{}'
-  const parsed = JSON.parse(raw) as { items?: { titleZh: string; note: string }[] }
-  if (!parsed.items) throw new Error('AI 回傳格式錯誤')
-  return parsed.items
+  // 加了摘要後輸出長很多，萬一撞到 token 上限會被截成殘缺 JSON。
+  // 這時寧可讓整頁降級成英文標題（下游每項都有 ?? 退路），也不要整支 API 掛掉。
+  try {
+    const parsed = JSON.parse(raw) as { items?: { titleZh: string; summary: string; note: string }[] }
+    return parsed.items ?? []
+  } catch {
+    console.error('[idea-spark] AI 回傳無法解析，長度', raw.length, '結尾', raw.slice(-80))
+    return []
+  }
 }
 
 export async function GET(request: Request) {
@@ -206,6 +219,7 @@ export async function GET(request: Request) {
         return {
           title: h.title,
           titleZh: annotations[i]?.titleZh ?? h.title,
+          summary: annotations[i]?.summary ?? '',
           note: annotations[i]?.note ?? '',
           url: h.url ?? hnUrl,
           hnUrl,
