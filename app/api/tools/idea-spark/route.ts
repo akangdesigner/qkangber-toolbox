@@ -155,14 +155,20 @@ async function translateAndAnnotate(
 
 對輸入的每一項，輸出：
 - titleZh：用繁體中文具體說明「這個產品在做什麼、給誰用」，25–45 字，像跟朋友介紹一個東西，不是把標題直翻成新聞標題。有附「網站簡介」或「作者自述」時一定要根據那些內容寫（兩個都有就一起參考，作者自述通常更清楚講出它在解決什麼問題）；兩者都沒有才憑標題合理推測，但不要瞎掰不存在的功能或數字。
-- note：一句完整的話（15–40 字），具體講「這個點子換一個場景/族群/地區會變成什麼」，不要只寫「省時省錢」「方便好用」這種空泛好處標籤
+- note：一句完整的話（15–40 字），講這個點子搬到台灣的某個具體場景會變成什麼。必須指名道姓：哪一種人、在什麼場合、原本是怎麼處理這件事的。寫完自問「這句話換到另一則產品上還成立嗎」，如果成立就是太空泛，重寫。
 
 titleZh 範例（照這個具體程度寫，不要只是翻譯標題）：
 - 標題 "Show HN: Bunkr – open-source file manager" ｜ 網站簡介 "Self-hosted alternative to Google Drive with end-to-end encryption" → titleZh: "可以自己架的雲端硬碟，檔案端對端加密，取代 Google Drive"
 
-note 範例（照這個具體程度寫，不要只寫形容詞）：
-- 原題 "CouponHunt – Product Hunt for Coupons" → note: "换成台灣夜市/團媽優惠券的版本，應該也有人要"
-- 原題 "Self-hostable store for loyalty cards" → note: "小店家自己管會員點數不用被平台抽成，餐飲業可能買單"
+note 範例（重點是指名道姓的場景和「原本怎麼做」，不是市場評語）：
+- 原題 "CouponHunt – Product Hunt for Coupons" → note: "團媽現在靠 LINE 群組轉發優惠碼，做成能搜尋的站就省事了"
+- 原題 "Self-hostable store for loyalty cards" → note: "巷口早餐店還在蓋紙本集點卡，蓋滿送一杯那種可以搬上手機"
+- 原題 "Bribes.fyi – Built something to report bribes" → note: "台灣版可以盯工程標案，把得標價和底價的落差攤開來看"
+
+note 嚴禁這幾種寫法（這是最常見的失敗模式）：
+- 用「應該有人會買單」「可能有商機」「應該會很吸睛」「會吸引一批人」這類市場斷言收尾——這些是評語不是點子
+- 「換成 X 的話，應該會 Y」這個句型連續套用在每一則上
+- 只把 titleZh 換個詞重講一遍
 
 只回傳 JSON object，順序要跟輸入完全一致：
 {"items":[{"titleZh":"...","note":"..."}, ...]}`,
