@@ -6,6 +6,8 @@ type Meme = { id: string; 圖片連結: string; 頁面連結: string; 標題: st
 type MatchTarget = { 種類: '官網文章' | '新聞'; 標題: string; 摘要: string; 連結: string; 來源: string }
 type MatchResult = { 分數: number; 理由: string; 目標: MatchTarget }
 type Suggestion = { 梗圖: Meme; 分數: number; 理由: string }
+type Template = { id: string; name: string; url: string; box_count: number }
+type TemplateSuggestion = { 模板: Template; 分數: number; 理由: string; 文字: string[] }
 
 // 選定的梗圖：memes.tw 的有公開網址（可自動附圖）；上傳的只有 base64（發文要手動補圖）
 type Picked =
@@ -36,6 +38,8 @@ export default function MemeBoard() {
   const [主題, set主題] = useState('')
   const [suggesting, setSuggesting] = useState(false)
   const [suggestions, setSuggestions] = useState<Suggestion[] | null>(null)
+  const [templateSuggestions, setTemplateSuggestions] = useState<TemplateSuggestion[]>([])
+  const [copiedTemplate, setCopiedTemplate] = useState<string | null>(null)
 
   const [matching, setMatching] = useState(false)
   const [解讀, set解讀] = useState('')
@@ -83,6 +87,7 @@ export default function MemeBoard() {
     if (!t) return
     setSuggesting(true)
     setSuggestions(null)
+    setTemplateSuggestions([])
     setPicked(null)
     resetResult()
     try {
@@ -94,6 +99,7 @@ export default function MemeBoard() {
       const json = await res.json()
       if (!res.ok || !json.ok) throw new Error(json.error ?? res.status)
       setSuggestions(json.suggestions ?? [])
+      setTemplateSuggestions(json.templateSuggestions ?? [])
     } catch (e) {
       alert('推薦失敗：' + e)
     }
@@ -245,9 +251,11 @@ export default function MemeBoard() {
       {/* 推薦結果 */}
       {suggestions && (
         <section>
+          <h3 className="mb-2 text-sm font-medium text-slate-300">現成本土梗圖（直接發）</h3>
           {suggestions.length === 0 ? (
             <p className="text-sm text-slate-500">
-              最新 50 張裡沒有調性搭得上的。換個講法，或直接從下面的梗圖牆自己挑。
+              memes.tw 最新的梗圖裡沒有調性搭得上的
+              {templateSuggestions.length > 0 ? '——看下面的經典格式。' : '。換個講法，或從下面的梗圖牆自己挑。'}
             </p>
           ) : (
             <div className="space-y-3">
@@ -281,6 +289,68 @@ export default function MemeBoard() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* 經典空白格式：AI 挑格式並把字寫好，合成要自己來 */}
+          {templateSuggestions.length > 0 && (
+            <div className="mt-6">
+              <h3 className="mb-1 text-sm font-medium text-slate-300">經典格式（字幫你寫好，圖要自己合成）</h3>
+              <p className="mb-3 text-xs text-slate-500">
+                冷門主題 memes.tw 常常沒有，這些格式永遠都在。把文字貼到{' '}
+                <a
+                  href="https://memes.tw/maker"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline decoration-dotted hover:text-slate-300"
+                >
+                  梗圖產生器
+                </a>{' '}
+                或 Imgflip 就能合成。
+              </p>
+              <div className="space-y-3">
+                {templateSuggestions.map((t) => (
+                  <div
+                    key={t.模板.id}
+                    className="flex flex-wrap gap-4 rounded-xl border border-white/10 bg-white/[0.02] p-3"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={t.模板.url}
+                      alt={t.模板.name}
+                      referrerPolicy="no-referrer"
+                      className="h-32 w-32 rounded-lg object-contain bg-black/40"
+                    />
+                    <div className="flex-1 min-w-52 space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="rounded-full bg-sky-500/15 border border-sky-500/30 px-2 py-0.5 text-xs text-sky-300">
+                          {t.分數} 分
+                        </span>
+                        <span className="text-xs text-slate-500 truncate">{t.模板.name}</span>
+                      </div>
+                      <p className="text-sm text-slate-300">{t.理由}</p>
+                      <ol className="space-y-1">
+                        {t.文字.map((line, i) => (
+                          <li key={i} className="flex gap-2 text-sm">
+                            <span className="text-slate-600">{i + 1}.</span>
+                            <span className="text-slate-100">{line || <em className="text-slate-600">（留白）</em>}</span>
+                          </li>
+                        ))}
+                      </ol>
+                      <button
+                        onClick={() => {
+                          navigator.clipboard.writeText(t.文字.filter(Boolean).join('\n'))
+                          setCopiedTemplate(t.模板.id)
+                          setTimeout(() => setCopiedTemplate(null), 1500)
+                        }}
+                        className="rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 px-3 py-1.5 text-sm text-slate-200"
+                      >
+                        {copiedTemplate === t.模板.id ? '已複製 ✓' : '複製文字'}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </section>
