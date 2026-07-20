@@ -1,13 +1,13 @@
 import { NextResponse } from 'next/server'
-import { fetchMemes } from '@/lib/memes'
+import { fetchTemplates } from '@/lib/imgflip'
 
 export const dynamic = 'force-dynamic'
 
-// 讀 memes.tw 官方 RSS 的最新梗圖（沒有搜尋和翻頁，原因見 lib/memes.ts）
+// 全部經典格式，給前端自己瀏覽挑（不經過 AI 篩選）
 export async function GET() {
   try {
-    const memes = await fetchMemes()
-    return NextResponse.json({ ok: true, memes })
+    const templates = await fetchTemplates()
+    return NextResponse.json({ ok: true, templates })
   } catch (e) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })
   }
