@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getGroqClient, GROQ_MODEL } from '@/lib/groq'
+import { chatJSON } from '@/lib/llm-json'
 import { fetchMemes, type Meme } from '@/lib/memes'
 import { fetchTemplates, type Template } from '@/lib/imgflip'
 
@@ -39,17 +39,12 @@ export async function POST(req: NextRequest) {
 
     // 標題是圖上已經配好的字，拿來判斷調性夠用了，不必對 50 張都跑看圖模型
     const list = memes.map((m, i) => `${i}. ${m.標題}`).join('\n')
-    const templateList = templates.map((t, i) => `${i}. ${t.name}（${t.box_count} 格字）`).join('\n')
+    const templateList = templates
+      .map((t, i) => `${i}. ${t.name}（${t.box_count} 格）｜用法：${t.用法}`)
+      .join('\n')
 
-    const client = getGroqClient()
-    const res = await client.chat.completions.create({
-      model: GROQ_MODEL,
-      max_tokens: 900,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: `你幫一個台灣的自動化/AI 工程師挑梗圖發 Threads。他會給你一個主題，你要給他兩種素材建議。
+    const raw = await chatJSON(
+      `你幫一個台灣的自動化/AI 工程師挑梗圖發 Threads。他會給你一個主題，你要給他兩種素材建議。
 
 【A. 現成梗圖】清單上每一項是一張別人已經配好字的梗圖，文字就是圖上的字。他直接拿圖來發，不能改圖上的字。
 
@@ -83,9 +78,13 @@ export async function POST(req: NextRequest) {
 
 【B. 空白模板】這些是經典梗圖格式（空白的，字還沒寫）。挑 2–3 個最適合這個主題的格式，並且幫他把每一格的字寫好。
 
+每個格式後面都附了「用法」，寫字之前先看懂它，每一格要照用法放對應的東西。用法說「1 跟 3 要講同一句話」就真的要一樣，說「合起來要是通順的一句話」就真的要接得起來。沒照用法寫，那張圖就廢了。
+
 - 每一格的字用繁體中文，短、口語、有哏，一格最多 15 字
 - 文字陣列的長度要剛好等於那個模板的格數，每一格都要有字，不要留空
 - 寫的是「要印在圖上的台詞」，不是在描述畫面。像「驚訝皮卡丘臉」「他一臉無奈」這種是描述，不合格；那一格該寫的是那個表情底下會配的話
+- 產品和公司名稱拼對：Gemini、Claude、ChatGPT、OpenAI、n8n。拼錯就整張作廢
+- 光把主題複述一遍不算哏。要有轉折、有落差、或有自嘲，讀的人會笑出來才算
 - 這是他的專業帳號，寫得聰明帶點自嘲，不要低級或人身攻擊
 - 格式要真的對位：講「期待落空」用期待vs現實類、講「二選一的兩難」用 Two Buttons、講「捨棄舊的選新的」用 Drake
 
@@ -93,15 +92,10 @@ export async function POST(req: NextRequest) {
 {"推薦":[{"編號":數字,"分數":0到10,"理由":"一句話"}],
  "模板":[{"編號":數字,"分數":0到10,"理由":"一句話","文字":["第一格","第二格"]}]}
 推薦最多 5 個、模板最多 3 個，都照分數高到低。全部用繁體中文。`,
-        },
-        {
-          role: 'user',
-          content: `主題：${主題}\n\n【A. 現成梗圖清單】\n${list || '（這次抓不到）'}\n\n【B. 空白模板清單】\n${templateList || '（這次抓不到）'}`,
-        },
-      ],
-    })
+      `主題：${主題}\n\n【A. 現成梗圖清單】\n${list || '（這次抓不到）'}\n\n【B. 空白模板清單】\n${templateList || '（這次抓不到）'}`,
+      1200
+    )
 
-    const raw = res.choices[0]?.message?.content ?? '{}'
     let picked: { 編號: number; 分數: number; 理由: string }[] = []
     let pickedTemplates: { 編號: number; 分數: number; 理由: string; 文字: string[] }[] = []
     try {
