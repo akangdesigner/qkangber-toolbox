@@ -11,71 +11,58 @@ const BLOG_BASE = 'https://aiqkangber.com/blog'
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
-// memes.tw 的 Cloudflare 會擋 Node fetch 的 TLS 指紋，但 curl 帶瀏覽器 header 過得了。
-// 這個工具箱在本機跑，Windows 內建 curl.exe，直接用它抓 HTML。
-async function fetchHtmlViaCurl(url: string): Promise<string> {
-  const { execFile } = await import('node:child_process')
-  return new Promise((resolve, reject) => {
-    execFile(
-      'curl',
-      [
-        '-s', '--max-time', '15', '--compressed',
-        '-H', `User-Agent: ${UA}`,
-        '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        '-H', 'Accept-Language: zh-TW,zh;q=0.9',
-        url,
-      ],
-      { maxBuffer: 10 * 1024 * 1024, encoding: 'utf8' },
-      (err, stdout) => {
-        if (err) reject(new Error('curl 抓取失敗：' + err.message))
-        else if (!stdout || stdout.length < 500) reject(new Error('memes.tw 回傳空頁（可能被擋）'))
-        else resolve(stdout)
-      }
-    )
-  })
-}
-
 export type Meme = {
   id: string
   圖片連結: string
   頁面連結: string
-  作者: string
+  標題: string
 }
 
-// memes.tw 列表頁（q 留空＝熱門）。頁面是 server render，直接 parse HTML。
-export async function fetchMemes(q = '', page = 1): Promise<Meme[]> {
-  const params = new URLSearchParams()
-  if (q) params.set('q', q)
-  if (page > 1) params.set('page', String(page))
-  const qs = params.toString()
-  const html = await fetchHtmlViaCurl(`https://memes.tw/wtf${qs ? '?' + qs : ''}`)
+// memes.tw 的網頁端（/wtf、詳細頁）現在被 Cloudflare 全面擋掉，curl 帶瀏覽器 header 也是 403，
+// 換 Node/Python 客戶端一樣擋，代表擋的是非瀏覽器的連線特徵而不是 header。
+// 但官方 RSS（robots.txt 全站允許）沒有防護，而且比爬 HTML 更好用：
+// 結構化、附標題（省掉原本每張圖再打一次詳細頁拿標題）。
+// 代價是 RSS 只給最新 50 則，?q= / ?page= / ?tag= 都會被忽略——所以沒有搜尋和翻頁。
+const RSS_URL = 'https://memes.tw/rss'
 
-  // 每張卡：<div ... data-id="581624"> <a href="/wtf/581624"> <img ... data-src="https://memeprod...">
+const decodeCdata = (s: string) =>
+  s
+    .replace(/<!\[CDATA\[/g, '')
+    .replace(/\]\]>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+
+export async function fetchMemes(): Promise<Meme[]> {
+  const res = await fetch(RSS_URL, {
+    headers: { 'User-Agent': UA, 'Accept-Language': 'zh-TW,zh;q=0.9' },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!res.ok) throw new Error(`memes.tw RSS 回應 ${res.status}`)
+  const xml = await res.text()
+
   const memes: Meme[] = []
   const seen = new Set<string>()
-  const cardRe = /data-id="(\d+)"[\s\S]{0,600}?data-src="(https:\/\/memeprod[^"]+)"/g
-  let m: RegExpExecArray | null
-  while ((m = cardRe.exec(html))) {
-    const [, id, img] = m
-    if (seen.has(id)) continue
+  for (const block of xml.split(/<item[\s>]/).slice(1)) {
+    const img = block.match(/<image>([^<]+)<\/image>/)?.[1]?.trim() ?? ''
+    const link = block.match(/<link>([^<]+)<\/link>/)?.[1]?.trim() ?? ''
+    const id = link.match(/\/wtf\/(\d+)/)?.[1] ?? ''
+    if (!img || !id || seen.has(id)) continue
     seen.add(id)
-    // 作者在卡片後面一點：<a href="/wtf/user/xxx">名字</a>
-    const after = html.slice(m.index, m.index + 2000)
-    const author = after.match(/\/wtf\/user\/\d+">([^<]+)<\/a>/)?.[1] ?? ''
-    memes.push({ id, 圖片連結: img, 頁面連結: `https://memes.tw/wtf/${id}`, 作者: author.trim() })
+    memes.push({
+      id,
+      圖片連結: img,
+      頁面連結: link,
+      標題: decodeCdata(block.match(/<title>([\s\S]*?)<\/title>/)?.[1] ?? ''),
+    })
   }
+  if (memes.length === 0) throw new Error('memes.tw RSS 解析不到梗圖')
   return memes
-}
-
-// 梗圖詳細頁的標題（配對時當輔助線索；抓不到就算了）
-export async function fetchMemeTitle(id: string): Promise<string> {
-  try {
-    const html = await fetchHtmlViaCurl(`https://memes.tw/wtf/${id}`)
-    const t = html.match(/<title>([^<|]+)/)?.[1] ?? ''
-    return t.trim()
-  } catch {
-    return ''
-  }
 }
 
 // ---- 官網文章（posts 分頁：slug title date tags excerpt content featured published）----

@@ -1,14 +1,12 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
 import { fetchMemes } from '@/lib/memes'
 
 export const dynamic = 'force-dynamic'
 
-// 瀏覽/搜尋 memes.tw 梗圖（q 留空＝熱門）
-export async function GET(req: NextRequest) {
-  const q = req.nextUrl.searchParams.get('q') ?? ''
-  const page = Math.max(1, Number(req.nextUrl.searchParams.get('page') ?? '1') || 1)
+// 讀 memes.tw 官方 RSS 的最新梗圖（沒有搜尋和翻頁，原因見 lib/memes.ts）
+export async function GET() {
   try {
-    const memes = await fetchMemes(q.trim(), page)
+    const memes = await fetchMemes()
     return NextResponse.json({ ok: true, memes })
   } catch (e) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getGroqClient, GROQ_MODEL } from '@/lib/groq'
-import { fetchMemeTitle, fetchNewsHeadlines, getBlogPosts } from '@/lib/memes'
+import { fetchNewsHeadlines, getBlogPosts } from '@/lib/memes'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -25,18 +25,15 @@ export type MatchResult = {
 // 1) 看圖解讀梗圖 → 2) 跟官網文章＋當日新聞標題配對，回前 5 名
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as { 圖片連結?: string; imageBase64?: string; memeId?: string }
+    const body = (await req.json()) as { 圖片連結?: string; imageBase64?: string; 標題?: string }
     const imageUrl = body.imageBase64 || body.圖片連結
     if (!imageUrl) return NextResponse.json({ ok: false, error: '缺少梗圖（圖片連結或上傳圖）' }, { status: 400 })
 
     const client = getGroqClient()
 
-    // 梗圖標題（memes.tw 的才有）當輔助線索，跟看圖同時進行
-    const [titleHint, posts, news] = await Promise.all([
-      body.memeId ? fetchMemeTitle(body.memeId) : Promise.resolve(''),
-      getBlogPosts(),
-      fetchNewsHeadlines(),
-    ])
+    // 梗圖標題現在跟著列表一起從 RSS 來（上傳的圖沒有），不必再多打一次詳細頁
+    const titleHint = (body.標題 ?? '').trim()
+    const [posts, news] = await Promise.all([getBlogPosts(), fetchNewsHeadlines()])
 
     // 看圖：圖中文字 + 情境情緒。看圖失敗就退回只用標題硬配。
     let 梗圖解讀 = ''

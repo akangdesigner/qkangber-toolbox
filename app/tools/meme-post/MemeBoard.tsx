@@ -2,13 +2,13 @@
 
 import { useEffect, useRef, useState } from 'react'
 
-type Meme = { id: string; 圖片連結: string; 頁面連結: string; 作者: string }
+type Meme = { id: string; 圖片連結: string; 頁面連結: string; 標題: string }
 type MatchTarget = { 種類: '官網文章' | '新聞'; 標題: string; 摘要: string; 連結: string; 來源: string }
 type MatchResult = { 分數: number; 理由: string; 目標: MatchTarget }
 
 // 選定的梗圖：memes.tw 的有公開網址（可自動附圖）；上傳的只有 base64（發文要手動補圖）
 type Picked =
-  | { kind: 'web'; id: string; url: string }
+  | { kind: 'web'; id: string; url: string; 標題: string }
   | { kind: 'upload'; dataUrl: string }
 
 const kindColor: Record<string, string> = {
@@ -29,8 +29,6 @@ async function fileToDataUrl(file: File): Promise<string> {
 
 export default function MemeBoard() {
   const [memes, setMemes] = useState<Meme[]>([])
-  const [q, setQ] = useState('')
-  const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [picked, setPicked] = useState<Picked | null>(null)
 
@@ -48,14 +46,14 @@ export default function MemeBoard() {
   const fileRef = useRef<HTMLInputElement>(null)
   const resultRef = useRef<HTMLDivElement>(null)
 
-  async function loadMemes(keyword: string, p: number) {
+  async function loadMemes() {
     setLoading(true)
     try {
-      const res = await fetch(`/api/tools/meme-post/memes?q=${encodeURIComponent(keyword)}&page=${p}`)
+      const res = await fetch('/api/tools/meme-post/memes')
       const json = await res.json()
       if (!res.ok || !json.ok) throw new Error(json.error ?? res.status)
       setMemes(json.memes ?? [])
-      if ((json.memes ?? []).length === 0) alert(keyword ? `「${keyword}」搜不到梗圖` : '抓不到梗圖')
+      if ((json.memes ?? []).length === 0) alert('抓不到梗圖')
     } catch (e) {
       alert('抓梗圖失敗：' + e)
     }
@@ -63,7 +61,7 @@ export default function MemeBoard() {
   }
 
   useEffect(() => {
-    loadMemes('', 1)
+    loadMemes()
   }, [])
 
   function resetResult() {
@@ -90,7 +88,9 @@ export default function MemeBoard() {
     resetResult()
     try {
       const body =
-        picked.kind === 'web' ? { 圖片連結: picked.url, memeId: picked.id } : { imageBase64: picked.dataUrl }
+        picked.kind === 'web'
+          ? { 圖片連結: picked.url, 標題: picked.標題 }
+          : { imageBase64: picked.dataUrl }
       const res = await fetch('/api/tools/meme-post/match', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -169,30 +169,16 @@ export default function MemeBoard() {
 
   return (
     <div className="space-y-8">
-      {/* 來源：搜尋 / 熱門 / 上傳 */}
+      {/* 來源：memes.tw 最新 / 上傳 */}
       <div className="flex flex-wrap items-center gap-2">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault()
-            setPage(1)
-            loadMemes(q.trim(), 1)
-          }}
-          className="flex gap-2 flex-1 min-w-60"
+        <button
+          onClick={() => loadMemes()}
+          disabled={loading}
+          className="rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white"
         >
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="搜梗圖關鍵字（留空＝memes.tw 熱門）"
-            className="flex-1 rounded-lg bg-black/30 border border-white/10 px-4 py-2 text-sm text-slate-200 placeholder-slate-600 outline-none focus:border-violet-400"
-          />
-          <button
-            type="submit"
-            disabled={loading}
-            className="rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white"
-          >
-            {loading ? '抓取中…' : '找梗圖'}
-          </button>
-        </form>
+          {loading ? '抓取中…' : '重新整理梗圖'}
+        </button>
+        <span className="text-xs text-slate-500 flex-1 min-w-40">memes.tw 最新 50 張</span>
         <button
           onClick={() => fileRef.current?.click()}
           className="rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 px-4 py-2 text-sm text-slate-300"
@@ -234,7 +220,7 @@ export default function MemeBoard() {
                 <button
                   key={m.id}
                   onClick={() => {
-                    setPicked({ kind: 'web', id: m.id, url: m.圖片連結 })
+                    setPicked({ kind: 'web', id: m.id, url: m.圖片連結, 標題: m.標題 })
                     resetResult()
                   }}
                   className={`group relative rounded-xl overflow-hidden border text-left transition-colors ${
@@ -244,14 +230,14 @@ export default function MemeBoard() {
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={m.圖片連結}
-                    alt={`梗圖 by ${m.作者}`}
+                    alt={m.標題 || '梗圖'}
                     loading="lazy"
                     referrerPolicy="no-referrer"
                     className="w-full aspect-square object-cover bg-black/40"
                   />
-                  {m.作者 && (
+                  {m.標題 && (
                     <span className="absolute bottom-0 inset-x-0 bg-black/60 px-2 py-1 text-[11px] text-slate-300 truncate">
-                      {m.作者}
+                      {m.標題}
                     </span>
                   )}
                   {selected && (
@@ -263,33 +249,7 @@ export default function MemeBoard() {
               )
             })}
           </div>
-          <div className="mt-3 flex items-center gap-2">
-            {page > 1 && (
-              <button
-                onClick={() => {
-                  const p = page - 1
-                  setPage(p)
-                  loadMemes(q.trim(), p)
-                }}
-                disabled={loading}
-                className="rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 px-3 py-1.5 text-sm text-slate-300"
-              >
-                ← 上一頁
-              </button>
-            )}
-            <button
-              onClick={() => {
-                const p = page + 1
-                setPage(p)
-                loadMemes(q.trim(), p)
-              }}
-              disabled={loading}
-              className="rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 px-3 py-1.5 text-sm text-slate-300"
-            >
-              下一頁 →
-            </button>
-            <span className="text-xs text-slate-600">第 {page} 頁 · 圖片來自 memes.tw</span>
-          </div>
+          <p className="mt-3 text-xs text-slate-600">{memes.length} 張 · 圖片來自 memes.tw</p>
         </section>
       )}
 
