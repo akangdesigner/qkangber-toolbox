@@ -11,6 +11,7 @@ type HNHit = {
   points: number
   num_comments: number
   created_at: string
+  story_text?: string | null // 作者自己在 HN 貼的介紹，官網沒 meta 時靠它
 }
 
 type Idea = {
@@ -27,6 +28,75 @@ type Idea = {
 type CacheEntry = { data: Idea[]; expires: number }
 const cache = new Map<string, CacheEntry>()
 const CACHE_TTL = 30 * 60 * 1000 // 30 分鐘，避免每次刷新都重打 HN + Groq
+
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+const META_FETCH_TIMEOUT = 3500
+const MAX_HTML_BYTES = 150_000
+
+// 只翻標題常常看不出產品在幹嘛，所以去抓官網的 meta description 當作 AI 寫說明的素材。
+// 抓失敗或抓不到就回空字串，AI 會退回只憑標題推測。
+async function fetchMetaDescription(url: string): Promise<string> {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), META_FETCH_TIMEOUT)
+    const res = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': UA }, redirect: 'follow' })
+    clearTimeout(timer)
+    if (!res.ok || !res.body) return ''
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let html = ''
+    let bytes = 0
+    while (bytes < MAX_HTML_BYTES) {
+      const { done, value } = await reader.read()
+      if (done) break
+      bytes += value.byteLength
+      html += decoder.decode(value, { stream: true })
+      if (/<\/head>/i.test(html)) break
+    }
+    reader.cancel().catch(() => {})
+
+    const match =
+      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i) ||
+      html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i) ||
+      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i) ||
+      html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i)
+    if (!match) return ''
+    const text = match[1]
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      // GitHub 的罐頭描述，留著只會讓 AI 以為產品在講 GitHub
+      .replace(/Contribute to [\w.-]+\/[\w.-]+ development by creating an account on GitHub\.?/gi, '')
+      .replace(/\s*-\s*[\w.-]+\/[\w.-]+$/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    return text.length < 15 ? '' : text.slice(0, 300)
+  } catch {
+    return ''
+  }
+}
+
+// 作者在 HN 貼文裡自己寫的介紹。官網常常沒有 meta description（個人部落格、GitHub Pages），
+// 這段是補位來源，而且通常比官網文案更直白講清楚在解決什麼問題。
+function cleanStoryText(raw: string | null | undefined): string {
+  if (!raw) return ''
+  const text = raw
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&#x2F;/gi, '/')
+    .replace(/&#x27;/gi, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    // 開頭的招呼語（Hi HN!／Hello HN,／Hey there!）對理解產品沒幫助
+    .replace(/^\s*(hi|hey|hello|greetings)[\s,!]*(hn|there|all|everyone|folks)?[\s,!—-]*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return text.length < 15 ? '' : text.slice(0, 400)
+}
 
 async function fetchShowHN(query: string): Promise<HNHit[]> {
   const params = new URLSearchParams()
@@ -51,7 +121,16 @@ async function fetchShowHN(query: string): Promise<HNHit[]> {
 
 async function translateAndAnnotate(hits: HNHit[]): Promise<{ titleZh: string; note: string }[]> {
   const client = getGroqClient()
-  const list = hits.map((h, i) => `${i}. ${h.title}`).join('\n')
+  const descriptions = await Promise.all(hits.map((h) => (h.url ? fetchMetaDescription(h.url) : Promise.resolve(''))))
+  const list = hits
+    .map((h, i) => {
+      const parts = [`${i}. 標題:${h.title}`]
+      if (descriptions[i]) parts.push(`網站簡介:${descriptions[i]}`)
+      const authorNote = cleanStoryText(h.story_text)
+      if (authorNote) parts.push(`作者自述:${authorNote}`)
+      return parts.join('｜')
+    })
+    .join('\n')
   const completion = await client.chat.completions.create({
     model: GROQ_MODEL,
     max_tokens: 2500,
@@ -62,8 +141,11 @@ async function translateAndAnnotate(hits: HNHit[]): Promise<{ titleZh: string; n
         content: `你幫台灣的獨立開發者/創業者整理 Hacker News 上的 Show HN 產品清單，激發創業靈感。
 
 對輸入的每一項，輸出：
-- titleZh：把標題意譯成自然的繁體中文，抓住這個產品在做什麼，不要逐字直翻
+- titleZh：用繁體中文具體說明「這個產品在做什麼、給誰用」，25–45 字，像跟朋友介紹一個東西，不是把標題直翻成新聞標題。有附「網站簡介」或「作者自述」時一定要根據那些內容寫（兩個都有就一起參考，作者自述通常更清楚講出它在解決什麼問題）；兩者都沒有才憑標題合理推測，但不要瞎掰不存在的功能或數字。
 - note：一句完整的話（15–40 字），具體講「這個點子換一個場景/族群/地區會變成什麼」，不要只寫「省時省錢」「方便好用」這種空泛好處標籤
+
+titleZh 範例（照這個具體程度寫，不要只是翻譯標題）：
+- 標題 "Show HN: Bunkr – open-source file manager" ｜ 網站簡介 "Self-hosted alternative to Google Drive with end-to-end encryption" → titleZh: "可以自己架的雲端硬碟，檔案端對端加密，取代 Google Drive"
 
 note 範例（照這個具體程度寫，不要只寫形容詞）：
 - 原題 "CouponHunt – Product Hunt for Coupons" → note: "换成台灣夜市/團媽優惠券的版本，應該也有人要"
