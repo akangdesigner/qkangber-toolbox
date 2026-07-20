@@ -119,15 +119,28 @@ async function fetchShowHN(query: string): Promise<HNHit[]> {
   return (json.hits ?? []) as HNHit[]
 }
 
-async function translateAndAnnotate(hits: HNHit[]): Promise<{ titleZh: string; note: string }[]> {
-  const client = getGroqClient()
+// 每則的說明素材。沒素材的 titleZh 只能靠標題猜，品質較差，所以要排到後面。
+type Material = { siteDesc: string; authorNote: string; hasMaterial: boolean }
+
+async function gatherMaterials(hits: HNHit[]): Promise<Material[]> {
   const descriptions = await Promise.all(hits.map((h) => (h.url ? fetchMetaDescription(h.url) : Promise.resolve(''))))
+  return hits.map((h, i) => {
+    const siteDesc = descriptions[i]
+    const authorNote = cleanStoryText(h.story_text)
+    return { siteDesc, authorNote, hasMaterial: Boolean(siteDesc || authorNote) }
+  })
+}
+
+async function translateAndAnnotate(
+  hits: HNHit[],
+  materials: Material[]
+): Promise<{ titleZh: string; note: string }[]> {
+  const client = getGroqClient()
   const list = hits
     .map((h, i) => {
       const parts = [`${i}. 標題:${h.title}`]
-      if (descriptions[i]) parts.push(`網站簡介:${descriptions[i]}`)
-      const authorNote = cleanStoryText(h.story_text)
-      if (authorNote) parts.push(`作者自述:${authorNote}`)
+      if (materials[i].siteDesc) parts.push(`網站簡介:${materials[i].siteDesc}`)
+      if (materials[i].authorNote) parts.push(`作者自述:${materials[i].authorNote}`)
       return parts.join('｜')
     })
     .join('\n')
@@ -179,20 +192,26 @@ export async function GET(request: Request) {
       return NextResponse.json({ success: true, ideas: [] })
     }
 
-    const annotations = await translateAndAnnotate(hits)
-    const ideas: Idea[] = hits.map((h, i) => {
-      const hnUrl = `https://news.ycombinator.com/item?id=${h.objectID}`
-      return {
-        title: h.title,
-        titleZh: annotations[i]?.titleZh ?? h.title,
-        note: annotations[i]?.note ?? '',
-        url: h.url ?? hnUrl,
-        hnUrl,
-        points: h.points,
-        comments: h.num_comments,
-        createdAt: h.created_at,
-      }
-    })
+    const materials = await gatherMaterials(hits)
+    const annotations = await translateAndAnnotate(hits, materials)
+    const ideas: Idea[] = hits
+      .map((h, i) => {
+        const hnUrl = `https://news.ycombinator.com/item?id=${h.objectID}`
+        return {
+          title: h.title,
+          titleZh: annotations[i]?.titleZh ?? h.title,
+          note: annotations[i]?.note ?? '',
+          url: h.url ?? hnUrl,
+          hnUrl,
+          points: h.points,
+          comments: h.num_comments,
+          createdAt: h.created_at,
+          hasMaterial: materials[i].hasMaterial,
+        }
+      })
+      // 抓不到素材的說明是硬猜的，往後擺；同組內維持原本的排序（熱門度／時間）
+      .sort((a, b) => Number(b.hasMaterial) - Number(a.hasMaterial))
+      .map(({ hasMaterial: _hasMaterial, ...idea }) => idea)
 
     cache.set(cacheKey, { data: ideas, expires: Date.now() + CACHE_TTL })
     return NextResponse.json({ success: true, ideas })
