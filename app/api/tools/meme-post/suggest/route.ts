@@ -40,7 +40,7 @@ export async function POST(req: NextRequest) {
     // 標題是圖上已經配好的字，拿來判斷調性夠用了，不必對 50 張都跑看圖模型
     const list = memes.map((m, i) => `${i}. ${m.標題}`).join('\n')
     const templateList = templates
-      .map((t, i) => `${i}. ${t.name}（${t.box_count} 格）｜用法：${t.用法}`)
+      .map((t, i) => `${i}. ${t.name}（${t.box_count} 格）${t.用法 ? `｜用法：${t.用法}` : ''}`)
       .join('\n')
 
     const raw = await chatJSON(
@@ -59,9 +59,11 @@ export async function POST(req: NextRequest) {
 - 5-7：調性接近，貼文寫得好可以接起來
 - 4 以下：字太短看不出哏、是某個人在講自己的私事、或綁死在別的事情上
 
-自我檢查（沒過就不要放進來）：
-把你寫的理由拿去套另一個完全不同的主題，如果照樣講得通，代表你是在硬湊——這張要拿掉。
-別人抱怨自己工作有多累、自己生活發生什麼事的圖，看起來什麼都能配，實際上什麼都不搭，是最常見的硬湊來源。
+再強調一次，因為很容易搞錯：圖跟主題「不同領域」完全不是問題，那正是這個玩法的重點。一張講便當發臭的圖拿來嘲諷新模型很雷，只要那個「看起來新、實際上壞掉」的落差對得上，就是好配對。不要因為圖沒提到 AI、沒提到股票就扣分。
+
+真正要擋的只有兩種：
+1. 你在腦補圖裡有什麼（字太少、看不出哏，卻編一個理由）
+2. 理由空到套哪個主題都成立（把你寫的理由換一個完全不同的主題唸唸看，照樣通順的話，就是這種，拿掉）
 
 絕對不要推薦的（這是專業帳號，推到就是幫他闖禍）：
 - 情色、性暗示、身體部位的黃腔
@@ -78,7 +80,8 @@ export async function POST(req: NextRequest) {
 
 【B. 空白模板】這些是經典梗圖格式（空白的，字還沒寫）。挑 2–3 個最適合這個主題的格式，並且幫他把每一格的字寫好。
 
-每個格式後面都附了「用法」，寫字之前先看懂它，每一格要照用法放對應的東西。用法說「1 跟 3 要講同一句話」就真的要一樣，說「合起來要是通順的一句話」就真的要接得起來。沒照用法寫，那張圖就廢了。
+有附「用法」的格式，寫字之前先看懂它，每一格要照用法放對應的東西。用法說「1 跟 3 要講同一句話」就真的要一樣，說「合起來要是通順的一句話」就真的要接得起來。沒照用法寫，那張圖就廢了。
+沒附用法的格式也可以選，但只有在你很確定那個梗實際上怎麼用的時候才選；不確定就挑有附用法的。
 
 - 每一格的字用繁體中文，短、口語、有哏，一格最多 15 字
 - 文字陣列的長度要剛好等於那個模板的格數，每一格都要有字，不要留空
@@ -89,14 +92,14 @@ export async function POST(req: NextRequest) {
 - 格式要真的對位：講「期待落空」用期待vs現實類、講「二選一的兩難」用 Two Buttons、講「捨棄舊的選新的」用 Drake
 
 只回 JSON：
-{"推薦":[{"編號":數字,"分數":0到10,"理由":"一句話"}],
+{"推薦":[{"編號":數字,"引用":"你正在講的那張圖上的字，原封不動抄前 12 個字","分數":0到10,"理由":"一句話"}],
  "模板":[{"編號":數字,"分數":0到10,"理由":"一句話","文字":["第一格","第二格"]}]}
 推薦最多 5 個、模板最多 3 個，都照分數高到低。全部用繁體中文。`,
       `主題：${主題}\n\n【A. 現成梗圖清單】\n${list || '（這次抓不到）'}\n\n【B. 空白模板清單】\n${templateList || '（這次抓不到）'}`,
       1200
     )
 
-    let picked: { 編號: number; 分數: number; 理由: string }[] = []
+    let picked: { 編號: number; 引用?: string; 分數: number; 理由: string }[] = []
     let pickedTemplates: { 編號: number; 分數: number; 理由: string; 文字: string[] }[] = []
     try {
       const parsed = JSON.parse(raw) as {
@@ -109,13 +112,24 @@ export async function POST(req: NextRequest) {
       throw new Error('AI 推薦回傳格式錯誤')
     }
 
+    // 模型有時會給 A 的編號、理由卻在講另一張圖，結果是圖文不符。
+    // 讓它抄一段圖上的字，用那段字回頭認圖；編號和引用對不上時以引用為準，
+    // 兩邊都對不上就整筆丟掉。
     const suggestions: Suggestion[] = picked
-      .filter((p) => memes[p.編號])
-      .map((p) => ({
-        梗圖: memes[p.編號],
-        分數: Math.max(0, Math.min(10, Math.round(p.分數))),
-        理由: p.理由 ?? '',
-      }))
+      .map((p) => {
+        const 引用 = (p.引用 ?? '').trim()
+        const byQuote = 引用 ? memes.find((m) => m.標題.includes(引用.slice(0, 8))) : undefined
+        const 梗圖 = byQuote ?? memes[p.編號]
+        if (!梗圖) return null
+        // 有引用但認不到任何一張，代表它在講清單上沒有的東西
+        if (引用 && !byQuote) return null
+        return {
+          梗圖,
+          分數: Math.max(0, Math.min(10, Math.round(p.分數))),
+          理由: p.理由 ?? '',
+        }
+      })
+      .filter((s): s is Suggestion => s !== null)
 
     const templateSuggestions: TemplateSuggestion[] = pickedTemplates
       .filter((p) => templates[p.編號])
