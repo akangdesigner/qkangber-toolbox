@@ -1,16 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { chatJSON } from '@/lib/llm-json'
-import { fetchMemes, type Meme } from '@/lib/memes'
 import { fetchTemplates, type Template } from '@/lib/imgflip'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
-
-export type Suggestion = {
-  梗圖: Meme
-  分數: number
-  理由: string
-}
 
 // 空白模板的建議：AI 挑格式並把每一格的中文字寫好，人再自己合成
 export type TemplateSuggestion = {
@@ -20,65 +13,25 @@ export type TemplateSuggestion = {
   文字: string[]
 }
 
-// 輸入主題（例：嘲諷台股）→ 從 memes.tw 最新梗圖裡挑調性搭得起來的幾張
-//
-// 重點：不是找「台股的梗圖」，而是找「嘲諷那個味道」的梗圖——主題由貼文文字負責，
-// 梗圖只負責情緒。池子只有最新 50 張，硬要主題吻合幾乎都會落空。
+// 輸入主題（例：嘲諷 Gemini 很笨）→ 挑經典梗圖格式，並把每一格的中文字寫好。
+// 合成交給前端的編輯器做（瀏覽器有系統中文字型，不會變豆腐方塊）。
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as { 主題?: string }
     const 主題 = (body.主題 ?? '').trim().slice(0, 200)
     if (!主題) return NextResponse.json({ ok: false, error: '請先輸入主題' }, { status: 400 })
 
-    // 兩種素材：memes.tw 的現成本土梗（有就最好），Imgflip 的經典空白格式（永遠都在，
-    // 冷門主題如 AI/工程靠它撐）。任一邊掛掉不影響另一邊。
-    const [memesResult, templatesResult] = await Promise.allSettled([fetchMemes(), fetchTemplates()])
-    const memes = memesResult.status === 'fulfilled' ? memesResult.value : []
-    const templates = templatesResult.status === 'fulfilled' ? templatesResult.value : []
-    if (memes.length === 0 && templates.length === 0) throw new Error('兩邊素材都抓不到')
-
-    // 標題是圖上已經配好的字，拿來判斷調性夠用了，不必對 50 張都跑看圖模型
-    const list = memes.map((m, i) => `${i}. ${m.標題}`).join('\n')
+    // 只用 Imgflip 的經典空白格式。memes.tw 的現成梗圖是別人配好字的成品，
+    // 改不了字、冷門主題也幾乎抽不到，所以不列入推薦。
+    const templates = await fetchTemplates()
     const templateList = templates
       .map((t, i) => `${i}. ${t.name}（${t.box_count} 格）${t.用法 ? `｜用法：${t.用法}` : ''}`)
       .join('\n')
 
     const raw = await chatJSON(
-      `你幫一個台灣的自動化/AI 工程師挑梗圖發 Threads。他會給你一個主題，你要給他兩種素材建議。
+      `你幫一個台灣的自動化/AI 工程師挑梗圖發 Threads。他會給你一個主題，你要從經典梗圖格式裡挑出最適合的，並且把每一格的字寫好。
 
-【A. 現成梗圖】清單上每一項是一張別人已經配好字的梗圖，文字就是圖上的字。他直接拿圖來發，不能改圖上的字。
-
-你看不到圖，只看得到圖上的那行字。所以你只能根據那行字判斷，不准腦補畫面裡有什麼。
-像「PHP 寫」「AC6 ALLMIND」這種只有幾個字、看不出情緒的，你其實無從判斷它搭不搭——這種一律不要推薦，更不准編一個「這張圖在自嘲工程師的無奈」之類的理由。理由只能講那行字本身讀起來的意思。
-
-怎麼挑（重要）：
-主題只是他想講的事，梗圖不需要也在講同一件事。要挑的是「情緒和情境對得上」的圖——他的主題如果是嘲諷，就找同樣在嘲諷、在無奈、在翻白眼的圖，主題的內容由他的貼文文字負責交代。硬要找字面上同主題的圖，反而會挑到很爛的結果。
-
-評分 0-10：
-- 8 以上：圖上那行字本身就是一個看得懂的哏，而且那個哏換到這個主題還是成立
-- 5-7：調性接近，貼文寫得好可以接起來
-- 4 以下：字太短看不出哏、是某個人在講自己的私事、或綁死在別的事情上
-
-再強調一次，因為很容易搞錯：圖跟主題「不同領域」完全不是問題，那正是這個玩法的重點。一張講便當發臭的圖拿來嘲諷新模型很雷，只要那個「看起來新、實際上壞掉」的落差對得上，就是好配對。不要因為圖沒提到 AI、沒提到股票就扣分。
-
-真正要擋的只有兩種：
-1. 你在腦補圖裡有什麼（字太少、看不出哏，卻編一個理由）
-2. 理由空到套哪個主題都成立（把你寫的理由換一個完全不同的主題唸唸看，照樣通順的話，就是這種，拿掉）
-
-絕對不要推薦的（這是專業帳號，推到就是幫他闖禍）：
-- 情色、性暗示、身體部位的黃腔
-- 攻擊特定政治人物或政黨、挑動族群對立
-- 人身攻擊、歧視、嘲笑外貌或性向
-- 看不出在講什麼的私人小圈圈梗（人名代號、遊戲工會內哏）
-這幾類一律不列入，寧可少推幾張。
-
-理由要具體講「這張的什麼情緒/情境搭得上這個主題」，不要寫「很適合」「很有趣」這種空話。
-
-寧可只給 2 張高分的，也不要湊滿 5 張爛的。真的都不搭就給空陣列——尤其他的主題是 AI、程式、工程這類，台灣梗圖圈很少做，通常就是沒有，這時候空的才是誠實的答案。
-
-清單只有幾十張隨機的新梗圖，多數主題本來就抽不到能用的。0 到 2 張是常態，推薦空陣列不會被扣分，硬湊才會。B 那組永遠有得挑，A 沒有就說沒有。
-
-【B. 空白模板】這些是經典梗圖格式（空白的，字還沒寫）。挑 2–3 個最適合這個主題的格式，並且幫他把每一格的字寫好。
+清單上是空白的經典梗圖格式（字還沒寫）。挑 2–3 個最適合這個主題的，幫他把每一格的字寫好。
 
 有附「用法」的格式，寫字之前先看懂它，每一格要照用法放對應的東西。用法說「1 跟 3 要講同一句話」就真的要一樣，說「合起來要是通順的一句話」就真的要接得起來。沒照用法寫，那張圖就廢了。
 沒附用法的格式也可以選，但只有在你很確定那個梗實際上怎麼用的時候才選；不確定就挑有附用法的。
@@ -88,48 +41,25 @@ export async function POST(req: NextRequest) {
 - 寫的是「要印在圖上的台詞」，不是在描述畫面。像「驚訝皮卡丘臉」「他一臉無奈」這種是描述，不合格；那一格該寫的是那個表情底下會配的話
 - 產品和公司名稱拼對：Gemini、Claude、ChatGPT、OpenAI、n8n。拼錯就整張作廢
 - 光把主題複述一遍不算哏。要有轉折、有落差、或有自嘲，讀的人會笑出來才算
-- 這是他的專業帳號，寫得聰明帶點自嘲，不要低級或人身攻擊
-- 格式要真的對位：講「期待落空」用期待vs現實類、講「二選一的兩難」用 Two Buttons、講「捨棄舊的選新的」用 Drake
+- 這是他的專業帳號，寫得聰明帶點自嘲，不要低級、不要人身攻擊、不要政治
+- 格式要真的對位：講「期待落空」用期待vs現實類、講「二選一的兩難」用 Two Buttons、講「捨棄舊的選新的」用 Drake、講「三個東西比較而其中一個很爛」用 Three-headed Dragon
+
+評分 0-10：格式跟主題的結構真的對上、字寫得有哏的給高分；格式硬套或字只是複述主題的給低分。
+理由要具體講「這個格式的什麼結構搭得上這個主題」，不要寫「很適合」「很有趣」這種空話。
 
 只回 JSON：
-{"推薦":[{"編號":數字,"引用":"你正在講的那張圖上的字，原封不動抄前 12 個字","分數":0到10,"理由":"一句話"}],
- "模板":[{"編號":數字,"分數":0到10,"理由":"一句話","文字":["第一格","第二格"]}]}
-推薦最多 5 個、模板最多 3 個，都照分數高到低。全部用繁體中文。`,
-      `主題：${主題}\n\n【A. 現成梗圖清單】\n${list || '（這次抓不到）'}\n\n【B. 空白模板清單】\n${templateList || '（這次抓不到）'}`,
+{"模板":[{"編號":數字,"分數":0到10,"理由":"一句話","文字":["第一格","第二格"]}]}
+最多 3 個，照分數高到低。全部用繁體中文。`,
+      `主題：${主題}\n\n【空白模板清單】\n${templateList}`,
       1200
     )
 
-    let picked: { 編號: number; 引用?: string; 分數: number; 理由: string }[] = []
     let pickedTemplates: { 編號: number; 分數: number; 理由: string; 文字: string[] }[] = []
     try {
-      const parsed = JSON.parse(raw) as {
-        推薦?: typeof picked
-        模板?: typeof pickedTemplates
-      }
-      picked = parsed.推薦 ?? []
-      pickedTemplates = parsed.模板 ?? []
+      pickedTemplates = (JSON.parse(raw) as { 模板?: typeof pickedTemplates }).模板 ?? []
     } catch {
       throw new Error('AI 推薦回傳格式錯誤')
     }
-
-    // 模型有時會給 A 的編號、理由卻在講另一張圖，結果是圖文不符。
-    // 讓它抄一段圖上的字，用那段字回頭認圖；編號和引用對不上時以引用為準，
-    // 兩邊都對不上就整筆丟掉。
-    const suggestions: Suggestion[] = picked
-      .map((p) => {
-        const 引用 = (p.引用 ?? '').trim()
-        const byQuote = 引用 ? memes.find((m) => m.標題.includes(引用.slice(0, 8))) : undefined
-        const 梗圖 = byQuote ?? memes[p.編號]
-        if (!梗圖) return null
-        // 有引用但認不到任何一張，代表它在講清單上沒有的東西
-        if (引用 && !byQuote) return null
-        return {
-          梗圖,
-          分數: Math.max(0, Math.min(10, Math.round(p.分數))),
-          理由: p.理由 ?? '',
-        }
-      })
-      .filter((s): s is Suggestion => s !== null)
 
     const templateSuggestions: TemplateSuggestion[] = pickedTemplates
       .filter((p) => templates[p.編號])
@@ -148,9 +78,8 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       ok: true,
-      suggestions,
       templateSuggestions,
-      掃描: { 現成梗圖: memes.length, 模板: templates.length },
+      掃描: { 模板: templates.length },
     })
   } catch (e) {
     return NextResponse.json({ ok: false, error: String(e) }, { status: 500 })
