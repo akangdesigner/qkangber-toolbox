@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 type Meme = { id: string; 圖片連結: string; 頁面連結: string; 標題: string }
 type MatchTarget = { 種類: '官網文章' | '新聞'; 標題: string; 摘要: string; 連結: string; 來源: string }
 type MatchResult = { 分數: number; 理由: string; 目標: MatchTarget }
+type Suggestion = { 梗圖: Meme; 分數: number; 理由: string }
 
 // 選定的梗圖：memes.tw 的有公開網址（可自動附圖）；上傳的只有 base64（發文要手動補圖）
 type Picked =
@@ -31,6 +32,10 @@ export default function MemeBoard() {
   const [memes, setMemes] = useState<Meme[]>([])
   const [loading, setLoading] = useState(false)
   const [picked, setPicked] = useState<Picked | null>(null)
+
+  const [主題, set主題] = useState('')
+  const [suggesting, setSuggesting] = useState(false)
+  const [suggestions, setSuggestions] = useState<Suggestion[] | null>(null)
 
   const [matching, setMatching] = useState(false)
   const [解讀, set解讀] = useState('')
@@ -70,6 +75,29 @@ export default function MemeBoard() {
     setChosen(null)
     setDraft('')
     setPermalink('')
+  }
+
+  async function runSuggest(e: React.FormEvent) {
+    e.preventDefault()
+    const t = 主題.trim()
+    if (!t) return
+    setSuggesting(true)
+    setSuggestions(null)
+    setPicked(null)
+    resetResult()
+    try {
+      const res = await fetch('/api/tools/meme-post/suggest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 主題: t }),
+      })
+      const json = await res.json()
+      if (!res.ok || !json.ok) throw new Error(json.error ?? res.status)
+      setSuggestions(json.suggestions ?? [])
+    } catch (e) {
+      alert('推薦失敗：' + e)
+    }
+    setSuggesting(false)
   }
 
   async function onUpload(file: File) {
@@ -127,8 +155,31 @@ export default function MemeBoard() {
     setDrafting(null)
   }
 
+  // 主題路線：不經過文章/新聞配對，直接拿主題＋這張梗圖寫貼文
+  async function makeTopicDraft(s: Suggestion) {
+    setDrafting(s.梗圖.id)
+    setPermalink('')
+    setPicked({ kind: 'web', id: s.梗圖.id, url: s.梗圖.圖片連結, 標題: s.梗圖.標題 })
+    try {
+      const res = await fetch('/api/tools/meme-post/draft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 主題: 主題.trim(), 梗圖標題: s.梗圖.標題, 理由: s.理由 }),
+      })
+      const json = await res.json()
+      if (!res.ok || !json.ok) throw new Error(json.error ?? res.status)
+      setChosen(null)
+      setDraft(json.draft ?? '')
+      setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth' }), 100)
+    } catch (e) {
+      alert('產草稿失敗：' + e)
+    }
+    setDrafting(null)
+  }
+
   async function publish() {
-    if (!chosen || !draft.trim() || !picked) return
+    if (!draft.trim() || !picked) return
+    if (!chosen && !主題.trim()) return
     setPosting(true)
     try {
       const canAttach = picked.kind === 'web'
@@ -140,9 +191,9 @@ export default function MemeBoard() {
           圖片連結: canAttach ? picked.url : '',
           配圖: canAttach ? '是' : '否',
           類型: '梗圖',
-          標題: chosen.目標.標題,
-          來源: chosen.目標.來源,
-          原文連結: chosen.目標.連結,
+          標題: chosen ? chosen.目標.標題 : 主題.trim(),
+          來源: chosen ? chosen.目標.來源 : 'memes.tw',
+          原文連結: chosen ? chosen.目標.連結 : '',
         }),
       })
       const json = await res.json().catch(() => ({}))
@@ -169,6 +220,72 @@ export default function MemeBoard() {
 
   return (
     <div className="space-y-8">
+      {/* 主題 → 推薦梗圖 */}
+      <section className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
+        <form onSubmit={runSuggest} className="flex flex-wrap gap-2">
+          <input
+            value={主題}
+            onChange={(e) => set主題(e.target.value)}
+            placeholder="想發什麼？例：嘲諷台股、抱怨改需求、AI 取代工程師"
+            className="flex-1 min-w-60 rounded-lg bg-black/30 border border-white/10 px-4 py-2 text-sm text-slate-200 placeholder-slate-600 outline-none focus:border-violet-400"
+          />
+          <button
+            type="submit"
+            disabled={suggesting || !主題.trim()}
+            className="rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 px-4 py-2 text-sm font-medium text-white"
+          >
+            {suggesting ? '挑圖中…' : '推薦梗圖'}
+          </button>
+        </form>
+        <p className="mt-2 text-xs text-slate-500">
+          挑的是「情緒對得上」的圖，不是同主題的圖——主題由貼文文字負責講。
+        </p>
+      </section>
+
+      {/* 推薦結果 */}
+      {suggestions && (
+        <section>
+          {suggestions.length === 0 ? (
+            <p className="text-sm text-slate-500">
+              最新 50 張裡沒有調性搭得上的。換個講法，或直接從下面的梗圖牆自己挑。
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {suggestions.map((s) => (
+                <div
+                  key={s.梗圖.id}
+                  className="flex flex-wrap gap-4 rounded-xl border border-white/10 bg-white/[0.02] p-3"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={s.梗圖.圖片連結}
+                    alt={s.梗圖.標題 || '梗圖'}
+                    referrerPolicy="no-referrer"
+                    className="h-32 w-32 rounded-lg object-cover bg-black/40"
+                  />
+                  <div className="flex-1 min-w-52 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="rounded-full bg-violet-500/15 border border-violet-500/30 px-2 py-0.5 text-xs text-violet-300">
+                        {s.分數} 分
+                      </span>
+                      <span className="text-xs text-slate-500 truncate">{s.梗圖.標題}</span>
+                    </div>
+                    <p className="text-sm text-slate-300">{s.理由}</p>
+                    <button
+                      onClick={() => makeTopicDraft(s)}
+                      disabled={drafting !== null}
+                      className="rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 disabled:opacity-50 px-3 py-1.5 text-sm text-slate-200"
+                    >
+                      {drafting === s.梗圖.id ? '寫稿中…' : '用這張寫貼文'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* 來源：memes.tw 最新 / 上傳 */}
       <div className="flex flex-wrap items-center gap-2">
         <button

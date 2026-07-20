@@ -53,13 +53,11 @@ export async function fetchMemes(): Promise<Meme[]> {
     const link = block.match(/<link>([^<]+)<\/link>/)?.[1]?.trim() ?? ''
     const id = link.match(/\/wtf\/(\d+)/)?.[1] ?? ''
     if (!img || !id || seen.has(id)) continue
+    const 標題 = decodeCdata(block.match(/<title>([\s\S]*?)<\/title>/)?.[1] ?? '')
+    // 有些投稿沒寫標題，RSS 就直接放編號（"#581686"）。這種沒有文字線索，配對時只是雜訊。
+    if (!標題 || /^#?\d+$/.test(標題)) continue
     seen.add(id)
-    memes.push({
-      id,
-      圖片連結: img,
-      頁面連結: link,
-      標題: decodeCdata(block.match(/<title>([\s\S]*?)<\/title>/)?.[1] ?? ''),
-    })
+    memes.push({ id, 圖片連結: img, 頁面連結: link, 標題 })
   }
   if (memes.length === 0) throw new Error('memes.tw RSS 解析不到梗圖')
   return memes
