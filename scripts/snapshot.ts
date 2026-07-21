@@ -3,7 +3,7 @@
 // 由 Windows 工作排程器（工作名 qkangber-signal-log）每個平日 14:30 收盤後執行，不需要 dev server 在跑
 import { promises as fs } from 'fs'
 import path from 'path'
-import { analyzeStock, getMarketOverview, type StockHealth } from '../lib/stock'
+import { analyzeStock, getMarketOverview, type MarketOverview, type StockHealth } from '../lib/stock'
 import { logSnapshot, taipeiToday } from '../lib/signal-log'
 
 const DEFAULT_LIST = ['2330', '0050', '2412']
@@ -21,7 +21,7 @@ async function main() {
   // 逐輪重試：14:30 排程或凌晨補跑常遇到網路剛醒/瞬斷，一次 fetch failed 不該賠掉一整天的紀錄
   const RETRIES = 3, RETRY_GAP_MS = 20_000
   const ok = new Map<string, StockHealth>()
-  let market: Awaited<ReturnType<typeof getMarketOverview>> | null = null
+  let market: MarketOverview | null = null
   let lastErrors: string[] = []
   for (let round = 1; round <= RETRIES; round++) {
     const pending = symbols.filter((s) => !ok.has(s))
@@ -30,9 +30,13 @@ async function main() {
       console.log(`[snapshot] 第 ${round} 次嘗試（待重試 ${pending.length} 檔${market ? '' : '＋大盤'}），等 ${RETRY_GAP_MS / 1000}s…`)
       await new Promise((r) => setTimeout(r, RETRY_GAP_MS))
     }
+    // 先標好型別再丟進 Promise.all：不然 mkt 的推論會繞回上一輪指派的 market，TS 判成循環（TS7022）
+    const marketPromise: Promise<MarketOverview | null> = market
+      ? Promise.resolve(market)
+      : getMarketOverview().catch(() => null)
     const [results, mkt] = await Promise.all([
       Promise.all(pending.map((s) => analyzeStock(s))),
-      market ? Promise.resolve(market) : getMarketOverview().catch(() => null),
+      marketPromise,
     ])
     market = mkt
     lastErrors = []
