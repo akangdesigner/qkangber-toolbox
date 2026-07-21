@@ -269,7 +269,7 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
           disabled={fetching}
           className="rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 px-4 py-1.5 text-sm font-medium text-white"
         >
-          {fetching ? '抓取中…（約 1-2 分鐘）' : '抓最新新聞'}
+          {fetching ? '抓取中…（約 1 分鐘）' : '抓最新新聞'}
         </button>
         {candidates.length > 0 && (
           <div className="flex gap-1.5">

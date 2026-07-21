@@ -32,7 +32,7 @@ const FEEDS: Feed[] = [
   { name: 'Anthropic 動態', track: 'AI/LLM', url: 'https://news.google.com/rss/search?q=Anthropic%20OR%20Claude%20when:2d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant' },
   { name: 'Google News・AI', track: 'AI/LLM', url: 'https://news.google.com/rss/search?q=(AI%20OR%20LLM%20OR%20OpenAI%20OR%20Anthropic%20OR%20Gemini)%20when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant' },
   { name: 'iThome', track: '台灣科技', url: 'https://www.ithome.com.tw/rss' },
-  { name: 'INSIDE', track: '台灣科技', url: 'https://www.inside.com.tw/feed' },
+  { name: 'INSIDE', track: '台灣科技', url: 'https://www.inside.com.tw/feed/rss' },
   { name: 'Google News・科技', track: '科技綜合', url: 'https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=zh-TW&gl=TW&ceid=TW:zh-Hant' },
   { name: 'TechNews 科技新報', track: '科技綜合', url: 'https://technews.tw/feed/' },
   { name: '科技報橘', track: '科技綜合', url: 'https://buzzorange.com/techorange/feed/' },
@@ -40,6 +40,9 @@ const FEEDS: Feed[] = [
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+
+// 任何一個上游卡住都不該賠掉整次抓取（實測正常來源都在 1.5s 內回）
+const FETCH_TIMEOUT_MS = 15_000
 
 // Google News RSS 的連結是 news.google.com 轉址，用 batchexecute 還原成原文乾淨網址；失敗就回原值
 async function resolveGoogleNews(url: string): Promise<string> {
@@ -51,6 +54,7 @@ async function resolveGoogleNews(url: string): Promise<string> {
     const art = await fetch(`https://news.google.com/rss/articles/${id}`, {
       headers: { 'User-Agent': UA },
       cache: 'no-store',
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     })
     const ah = await art.text()
     const sig = ah.match(/data-n-a-sg="([^"]+)"/)
@@ -62,6 +66,7 @@ async function resolveGoogleNews(url: string): Promise<string> {
       method: 'POST',
       headers: { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
       body,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     })
     const txt = await r.text()
     const real = txt.match(/(https?:\/\/(?!news\.google)[^"\\]+)/)
@@ -74,6 +79,7 @@ async function resolveGoogleNews(url: string): Promise<string> {
 const PER_FEED = 4
 const HN_LIMIT = 4
 const GLOBAL_CAP = 14 // 每則要叫 Groq 生摘要+3草稿，太多會撞免費版每日 token 上限
+const REWRITE_CONCURRENCY = 4 // 同時丟給 Groq 的則數
 const MIN_SCORE = 6
 
 const SYSTEM_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一則科技新聞，請判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值，並針對它寫三種不同風格的 Threads 貼文。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要、感性、技術、討論。
@@ -122,6 +128,7 @@ async function fetchHackerNews(): Promise<Parsed[]> {
     const res = await fetch('https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30', {
       cache: 'no-store',
       headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     })
     if (!res.ok) return []
     const data = (await res.json()) as {
@@ -296,6 +303,7 @@ export async function fetchNewsCandidates(): Promise<{ items: Candidate[]; scann
       const res = await fetch(feed.url, {
         cache: 'no-store',
         headers: { 'User-Agent': 'Mozilla/5.0 (qkangber-toolbox news fetcher)' },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       })
       if (!res.ok) continue
       const xml = await res.text()
@@ -314,9 +322,18 @@ export async function fetchNewsCandidates(): Promise<{ items: Candidate[]; scann
   const slice = await Promise.all(
     picked.map(async (p) => ({ ...p, 原文連結: await resolveGoogleNews(p.原文連結) }))
   )
+  // 分批並行叫 Groq：一則一則排隊的話 14 則要 3-5 分鐘，前端會等到像當掉。
+  // 不一次全開是為了不撞 Groq 免費版的 rate limit。
+  const drafts: (Drafts | null)[] = []
+  for (let i = 0; i < slice.length; i += REWRITE_CONCURRENCY) {
+    const batch = slice.slice(i, i + REWRITE_CONCURRENCY)
+    // 單則失敗（rate limit／JSON 壞掉）只丟掉那則，不要賠掉整次抓取
+    drafts.push(...(await Promise.all(batch.map((n) => rewrite(n).catch(() => null)))))
+  }
+
   const items: Candidate[] = []
-  for (const n of slice) {
-    const r = await rewrite(n)
+  for (const [i, n] of slice.entries()) {
+    const r = drafts[i]
     if (!r || r.分數 < MIN_SCORE || (!r.感性 && !r.技術 && !r.討論)) continue
     const d = n.發布時間 && !isNaN(Date.parse(n.發布時間)) ? new Date(n.發布時間) : new Date()
     items.push({
