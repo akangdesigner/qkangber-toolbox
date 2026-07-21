@@ -78,9 +78,17 @@ async function resolveGoogleNews(url: string): Promise<string> {
 
 const PER_FEED = 4
 const HN_LIMIT = 4
-const GLOBAL_CAP = 14 // 每則要叫 Groq 生摘要+3草稿，太多會撞免費版每日 token 上限
+const GLOBAL_CAP = 8 // 每則都要叫 LLM，太多會撞 Groq 免費版每日 token 上限（100k TPD，全站功能共用）
 const REWRITE_CONCURRENCY = 4 // 同時丟給 Groq 的則數
 const MIN_SCORE = 6
+
+// 兩階段：先用小模型只打分數（便宜），只有過門檻的才用 70B 寫摘要＋3 草稿（貴）。
+// 以前是 14 則全部走 70B 寫完整草稿，再用 MIN_SCORE 丟掉大部分——等於為了丟掉的東西付全額。
+const SCORE_MODEL = 'llama-3.1-8b-instant'
+
+const SCORE_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一則科技新聞，請判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值。
+
+只回一個 JSON 物件，鍵剛好是 分數。分數是 0 到 10 的整數：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。不要寫任何理由。`
 
 const SYSTEM_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一則科技新聞，請判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值，並針對它寫三種不同風格的 Threads 貼文。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要、感性、技術、討論。
 
@@ -244,6 +252,43 @@ function dedupeByTitle(items: Parsed[]): Parsed[] {
 
 type Drafts = { 分數: number; 摘要: string; 感性: string; 技術: string; 討論: string }
 
+// 撞到每日 token 上限要讓前端講清楚，不能跟「今天沒新聞」長得一樣
+export class RateLimitError extends Error {
+  constructor(public retryAfter: string) {
+    super(`Groq 每日 token 額度已用完${retryAfter ? `，約 ${retryAfter} 後恢復` : ''}`)
+    this.name = 'RateLimitError'
+  }
+}
+
+function asRateLimit(e: unknown): RateLimitError | null {
+  const s = String(e)
+  if (!s.includes('429') && !s.includes('rate_limit')) return null
+  // Groq 給的是 "30m22.176s."，去掉句點和毫秒，講成「30m22s」就好
+  const t = (s.match(/try again in ([\dhms.]+)/)?.[1] ?? '').replace(/\.$/, '').replace(/\.\d+s$/, 's')
+  return new RateLimitError(t)
+}
+
+// 第一階段：只問分數，用小模型、max_tokens 抓很小
+async function score(n: Parsed): Promise<number> {
+  const client = getGroqClient()
+  const completion = await client.chat.completions.create({
+    model: SCORE_MODEL,
+    temperature: 0,
+    max_tokens: 40,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: SCORE_PROMPT },
+      { role: 'user', content: `標題:${n.標題}\n來源:${n.來源}\n分類:${n.類型}\n摘要:${n.摘要}` },
+    ],
+  })
+  try {
+    return Number((JSON.parse(completion.choices[0]?.message?.content ?? '') as { 分數?: number }).分數 ?? 0)
+  } catch {
+    return 0
+  }
+}
+
+// 第二階段：只有過門檻的才走到這裡，用 70B 寫摘要＋3 草稿
 async function rewrite(n: Parsed): Promise<Drafts | null> {
   const client = getGroqClient()
   const completion = await client.chat.completions.create({
@@ -322,18 +367,42 @@ export async function fetchNewsCandidates(): Promise<{ items: Candidate[]; scann
   const slice = await Promise.all(
     picked.map(async (p) => ({ ...p, 原文連結: await resolveGoogleNews(p.原文連結) }))
   )
-  // 分批並行叫 Groq：一則一則排隊的話 14 則要 3-5 分鐘，前端會等到像當掉。
-  // 不一次全開是為了不撞 Groq 免費版的 rate limit。
-  const drafts: (Drafts | null)[] = []
-  for (let i = 0; i < slice.length; i += REWRITE_CONCURRENCY) {
-    const batch = slice.slice(i, i + REWRITE_CONCURRENCY)
-    // 單則失敗（rate limit／JSON 壞掉）只丟掉那則，不要賠掉整次抓取
-    drafts.push(...(await Promise.all(batch.map((n) => rewrite(n).catch(() => null)))))
+  // 分批並行叫 Groq：一則一則排隊的話整趟要好幾分鐘，前端會等到像當掉。
+  // 不一次全開是為了不撞 Groq 的每分鐘 rate limit。
+  // 額度用完（429）要往外丟讓前端說清楚；其他單則失敗只丟掉那則，不賠掉整趟。
+  async function inBatches<T>(xs: Parsed[], fn: (n: Parsed) => Promise<T>): Promise<(T | null)[]> {
+    const out: (T | null)[] = []
+    for (let i = 0; i < xs.length; i += REWRITE_CONCURRENCY) {
+      out.push(
+        ...(await Promise.all(
+          xs.slice(i, i + REWRITE_CONCURRENCY).map((n) =>
+            fn(n).catch((e) => {
+              const rl = asRateLimit(e)
+              if (rl) throw rl
+              return null
+            })
+          )
+        ))
+      )
+    }
+    return out
   }
 
+  // 第一階段：小模型打分，把大部分新聞在這裡就刷掉，不必付 70B 的錢
+  const scores = await inBatches(slice, score)
+  const worthy = slice.filter((_, i) => (scores[i] ?? 0) >= MIN_SCORE)
+
+  // 第二階段：只有過門檻的才用 70B 寫摘要＋3 草稿
+  const written = await inBatches(worthy, rewrite)
+  const drafts = new Map<Parsed, Drafts>()
+  worthy.forEach((n, i) => {
+    const r = written[i]
+    if (r) drafts.set(n, r)
+  })
+
   const items: Candidate[] = []
-  for (const [i, n] of slice.entries()) {
-    const r = drafts[i]
+  for (const n of slice) {
+    const r = drafts.get(n)
     if (!r || r.分數 < MIN_SCORE || (!r.感性 && !r.技術 && !r.討論)) continue
     const d = n.發布時間 && !isNaN(Date.parse(n.發布時間)) ? new Date(n.發布時間) : new Date()
     items.push({

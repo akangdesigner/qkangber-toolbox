@@ -51,6 +51,8 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
         setTab(Object.fromEntries(items.map((c) => [c.原文連結, '感性' as VKey])))
         setWithImg(Object.fromEntries(items.map((c) => [c.原文連結, c.配圖 === '是' && !!c.圖片連結])))
         if (items.length === 0) alert(`掃了 ${json.scanned} 則，兩天內沒有新的夠分（或都發過了）。`)
+      } else if (json.rateLimited) {
+        alert(`${json.error}\n\n（Groq 免費版每天 100k token，站上所有 AI 功能共用。）`)
       } else {
         alert('抓取失敗：' + (json.error || res.status))
       }
