@@ -1,5 +1,7 @@
-// 台股自選股健檢：抓免費盤後日K（Yahoo Finance chart API），算均線/KD/MACD/多空排列/紅綠燈
-// 資料來源說明：Yahoo chart 一次給一整年日K，含上市(.TW)與上櫃(.TWO)；今天的訊號看最後一個收盤判斷。
+// 台股自選股健檢：抓免費盤後日K，算均線/KD/MACD/多空排列/紅綠燈
+// 資料來源說明：台股日K 走 TWSE／TPEx 官方端點（見 lib/tw-ohlc.ts），Yahoo 只留作
+// 美股指數與本機 fallback——Zeabur 機房 IP 被 Yahoo 擋掉，線上只有官方源進得來。
+import { fetchTwCandles, fetchTaiexCandles } from './tw-ohlc'
 
 export type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number }
 
@@ -144,6 +146,7 @@ type YahooChart = {
   }
 }
 
+// Yahoo 只留給美股指數與本機 fallback；台股主線在 lib/tw-ohlc.ts
 async function fetchYahoo(ySymbol: string): Promise<{ candles: Candle[]; meta: YahooMeta } | null> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ySymbol)}?range=1y&interval=1d`
   const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store' })
@@ -485,9 +488,27 @@ function judgeFundamental(rev: Revenue, pe: number | null, pb: number | null, yi
   return { score, signal, verdict }
 }
 
-// 代號解析：先試上市 .TW，失敗再試上櫃 .TWO；已含後綴則直接用
+// 代號解析：台股一律先走 TWSE/TPEx 官方來源，官方查不到（或本來就不是台股代號）才退回 Yahoo。
+// 順序是這樣排的原因：Zeabur 機房 IP 被 Yahoo 擋掉，線上只有官方源進得來；
+// 本機與美股代號則仍走 Yahoo，兩邊行為一致。
 async function resolve(symbol: string) {
   const s = symbol.trim().toUpperCase()
+  if (!s.includes('.')) {
+    const tw = await fetchTwCandles(s).catch(() => null)
+    if (tw && tw.candles.length > 60) {
+      const closes = tw.candles.map((c) => c.close)
+      return {
+        candles: tw.candles,
+        meta: {
+          symbol: s,
+          regularMarketPrice: closes[closes.length - 1],
+          shortName: tw.name,
+          chartPreviousClose: closes[closes.length - 2],
+        } as YahooMeta,
+        resolved: s + (tw.market === 'TWSE' ? '.TW' : '.TWO'),
+      }
+    }
+  }
   if (s.includes('.')) {
     const r = await fetchYahoo(s)
     return r ? { ...r, resolved: s } : null
@@ -748,12 +769,24 @@ export async function getMarketOverview(): Promise<MarketOverview> {
   const rawCandles: Record<string, Candle[]> = {} // 留住日K，給費半↔台股連動度計算用
   await Promise.all(
     defs.map(async (d) => {
-      const r = await fetchYahoo(d.ysym).catch(() => null)
-      if (!r || r.candles.length < 2) return
-      rawCandles[d.key] = r.candles
-      const closes = r.candles.map((c) => c.close)
+      // 加權指數改吃 TWSE 官方（Yahoo 在 Zeabur 上連不到）；美股三個指數官方無對應來源，仍走 Yahoo
+      let candles: Candle[] | null = null
+      let metaPrice: number | undefined
+      if (d.key === 'twii') {
+        const taiex = await fetchTaiexCandles().catch(() => [])
+        if (taiex.length >= 2) candles = taiex
+      }
+      if (!candles) {
+        const r = await fetchYahoo(d.ysym).catch(() => null)
+        if (!r || r.candles.length < 2) return
+        candles = r.candles
+        metaPrice = r.meta.regularMarketPrice
+      }
+      if (candles.length < 2) return
+      rawCandles[d.key] = candles
+      const closes = candles.map((c) => c.close)
       const last = closes.length - 1
-      const price = r.meta.regularMarketPrice ?? closes[last]
+      const price = metaPrice ?? closes[last]
       // 當日漲跌幅要用「昨收」＝倒數第二根日K的收盤；chartPreviousClose 在 range=1y 是一年前的收盤，不能用
       const prev = closes[last - 1]
       const changePct = prev ? ((price - prev) / prev) * 100 : 0
