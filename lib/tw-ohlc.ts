@@ -15,6 +15,15 @@ const HISTORY_MONTHS = 7 // 約 140 個交易日，夠算季線(60)與畫圖(120
 const MAX_CONCURRENT = 6
 const CACHE_TTL = 6 * 3600 * 1000
 
+// 快取世代：TWSE 約 14:00–15:00 才公布當日收盤，而排程是 16:30 跑。
+// 若只用固定 TTL，盤中抓到的「還沒有今日K棒」會被沿用到收盤後，
+// 排程就拿到舊資料、dataDate 停在昨天，又被下游的「只留今日」整批濾掉——
+// 正是這次要修的症狀。所以跨過 14:30 就換一個世代，強制重抓。
+function dataEpoch(): string {
+  const tp = new Date().toLocaleString('sv', { timeZone: 'Asia/Taipei' }) // "YYYY-MM-DD HH:MM:SS"
+  return tp.slice(0, 10) + (tp.slice(11, 16) >= '14:30' ? 'A' : 'B')
+}
+
 // ---------- 全域併發閘門 ----------
 let inFlight = 0
 const waiters: Array<() => void> = []
@@ -109,7 +118,21 @@ async function tpexMonth(code: string, y: number, m: number): Promise<{ candles:
 // ---------- 對外 ----------
 export type TwOhlc = { candles: Candle[]; name?: string; market: 'TWSE' | 'TPEx' }
 
-const cache = new Map<string, { at: number; data: TwOhlc | null }>()
+const cache = new Map<string, { at: number; epoch: string; data: TwOhlc | null }>()
+
+// 同時滿足「未過期」與「同一個資料世代」才算命中
+function cacheGet(key: string): { data: TwOhlc | null } | null {
+  const hit = cache.get(key)
+  if (!hit) return null
+  if (hit.epoch !== dataEpoch() || Date.now() - hit.at >= CACHE_TTL) {
+    cache.delete(key)
+    return null
+  }
+  return hit
+}
+function cacheSet(key: string, data: TwOhlc | null) {
+  cache.set(key, { at: Date.now(), epoch: dataEpoch(), data })
+}
 
 // 抓單一台股代號的日 K。先用「本月一次呼叫」判斷它是上市還是上櫃，
 // 確定交易所後才展開其餘月份——省掉對錯誤市場的 7 次無效請求。
@@ -117,8 +140,8 @@ export async function fetchTwCandles(code: string): Promise<TwOhlc | null> {
   const key = code.trim()
   if (!/^\d{4,6}[A-Z]?$/.test(key)) return null // 非台股代號（美股等）交給呼叫端退回 Yahoo
 
-  const hit = cache.get(key)
-  if (hit && Date.now() - hit.at < CACHE_TTL) return hit.data
+  const hit = cacheGet(key)
+  if (hit) return hit.data
 
   const months = recentMonths(HISTORY_MONTHS)
   const probe = months[months.length - 1] // 本月
@@ -166,7 +189,7 @@ export async function fetchTwCandles(code: string): Promise<TwOhlc | null> {
     }
   }
   if (!market) {
-    cache.set(key, { at: Date.now(), data: null }) // 確實查無此代號，也快取避免反覆重打
+    cacheSet(key, null) // 確實查無此代號，也快取避免反覆重打
     return null
   }
 
@@ -181,15 +204,15 @@ export async function fetchTwCandles(code: string): Promise<TwOhlc | null> {
 
   const candles = [...collected.values()].sort((a, b) => a.time - b.time)
   const data: TwOhlc = { candles, name, market }
-  cache.set(key, { at: Date.now(), data })
+  cacheSet(key, data)
   return data
 }
 
 // 加權指數日 K（TWSE 官方），取代 Yahoo 的 ^TWII
 export async function fetchTaiexCandles(): Promise<Candle[]> {
   const key = '__TAIEX__'
-  const hit = cache.get(key)
-  if (hit && Date.now() - hit.at < CACHE_TTL) return hit.data?.candles ?? []
+  const hit = cacheGet(key)
+  if (hit) return hit.data?.candles ?? []
 
   const collected = new Map<number, Candle>()
   const chunks = await Promise.all(
@@ -210,6 +233,6 @@ export async function fetchTaiexCandles(): Promise<Candle[]> {
   for (const chunk of chunks) for (const c of chunk) collected.set(c.time, c)
 
   const candles = [...collected.values()].sort((a, b) => a.time - b.time)
-  cache.set(key, { at: Date.now(), data: { candles, market: 'TWSE' } })
+  cacheSet(key, { candles, market: 'TWSE' })
   return candles
 }
