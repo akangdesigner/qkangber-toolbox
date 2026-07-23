@@ -78,7 +78,11 @@ async function resolveGoogleNews(url: string): Promise<string> {
 
 const PER_FEED = 4
 const HN_LIMIT = 4
-const GLOBAL_CAP = 8 // 每則都要叫 LLM，太多會撞 Groq 免費版每日 token 上限（100k TPD，全站功能共用）
+// 兩段各有自己的上限：打分用 8B 很便宜，可以多看一點；寫草稿的 70B 才是花錢的地方。
+// 以前共用一個 8 的上限，等於「排在前面的來源先填滿就結束」——HN 4 則＋OpenAI 4 則剛好吃光，
+// 中文來源（iThome/INSIDE/TechNews/科技報橘）永遠輪不到，所以抓回來的全是英文。
+const SCAN_CAP = 20 // 進第一階段打分的則數
+const WRITE_CAP = 8 // 進第二階段寫草稿的則數（撞 Groq 每日 100k TPD 的就是這段）
 const REWRITE_CONCURRENCY = 4 // 同時丟給 Groq 的則數
 const MIN_SCORE = 6
 
@@ -230,9 +234,36 @@ function properNouns(t: string): Set<string> {
   }
   return out
 }
+// 要共用兩個以上專有名詞才算同一則。只共用一個詞就殺太狠：
+// 「Gemini 延後、Pichai 捍衛 Google AI」跟「Alphabet 公布 Q2 財報」只因為都有 Gemini 就被當重複，
+// 中文標題英文詞本來就少，這條誤殺的幾乎都是中文則。單一共用詞的情況交給 jaccard 把關。
 function shareNoun(a: Set<string>, b: Set<string>): boolean {
-  for (const w of a) if (b.has(w)) return true
+  let n = 0
+  for (const w of a) if (b.has(w) && ++n >= 2) return true
   return false
+}
+
+// 依來源輪流取，別讓排在前面的來源把名額吃光（HN 和 OpenAI 各 4 則就填滿舊的 8 格上限）
+function interleaveBySource(items: Parsed[]): Parsed[] {
+  const groups = new Map<string, Parsed[]>()
+  for (const it of items) {
+    const g = groups.get(it.來源)
+    if (g) g.push(it)
+    else groups.set(it.來源, [it])
+  }
+  const lists = [...groups.values()]
+  const out: Parsed[] = []
+  for (let round = 0; out.length < items.length; round++) {
+    let moved = false
+    for (const l of lists) {
+      if (round < l.length) {
+        out.push(l[round])
+        moved = true
+      }
+    }
+    if (!moved) break
+  }
+  return out
 }
 function dedupeByTitle(items: Parsed[]): Parsed[] {
   const kept: Parsed[] = []
@@ -362,11 +393,7 @@ export async function fetchNewsCandidates(): Promise<{ items: Candidate[]; scann
     }
   }
 
-  const picked = dedupeByTitle(parsed).slice(0, GLOBAL_CAP)
-  // 把 Google News 轉址還原成原文乾淨網址（其餘來源原樣）
-  const slice = await Promise.all(
-    picked.map(async (p) => ({ ...p, 原文連結: await resolveGoogleNews(p.原文連結) }))
-  )
+  const picked = interleaveBySource(dedupeByTitle(parsed)).slice(0, SCAN_CAP)
   // 分批並行叫 Groq：一則一則排隊的話整趟要好幾分鐘，前端會等到像當掉。
   // 不一次全開是為了不撞 Groq 的每分鐘 rate limit。
   // 額度用完（429）要往外丟讓前端說清楚；其他單則失敗只丟掉那則，不賠掉整趟。
@@ -389,21 +416,32 @@ export async function fetchNewsCandidates(): Promise<{ items: Candidate[]; scann
   }
 
   // 第一階段：小模型打分，把大部分新聞在這裡就刷掉，不必付 70B 的錢
-  const scores = await inBatches(slice, score)
-  const worthy = slice.filter((_, i) => (scores[i] ?? 0) >= MIN_SCORE)
+  const scores = await inBatches(picked, score)
+  // 過門檻的照分數排，取前 WRITE_CAP 則——名額憑分數搶，不是憑來源排在前面
+  const worthy = picked
+    .map((n, i) => ({ n, s: scores[i] ?? 0 }))
+    .filter((x) => x.s >= MIN_SCORE)
+    .sort((a, b) => b.s - a.s)
+    .slice(0, WRITE_CAP)
+    .map((x) => x.n)
 
-  // 第二階段：只有過門檻的才用 70B 寫摘要＋3 草稿
-  const written = await inBatches(worthy, rewrite)
-  const drafts = new Map<Parsed, Drafts>()
-  worthy.forEach((n, i) => {
-    const r = written[i]
-    if (r) drafts.set(n, r)
+  // 把 Google News 轉址還原成原文乾淨網址（其餘來源原樣）。
+  // 放在打分之後：只有真的要寫草稿的那幾則才值得多送兩個請求去還原。
+  const resolved = (
+    await Promise.all(worthy.map(async (n) => ({ ...n, 原文連結: await resolveGoogleNews(n.原文連結) })))
+  ).filter((n) => {
+    if (seen.has(n.原文連結)) return false // 還原成原文網址後才認得出是發過的
+    seen.add(n.原文連結)
+    return true
   })
 
+  // 第二階段：只有過門檻的才用 70B 寫摘要＋3 草稿
+  const written = await inBatches(resolved, rewrite)
+
   const items: Candidate[] = []
-  for (const n of slice) {
-    const r = drafts.get(n)
-    if (!r || r.分數 < MIN_SCORE || (!r.感性 && !r.技術 && !r.討論)) continue
+  resolved.forEach((n, i) => {
+    const r = written[i]
+    if (!r || r.分數 < MIN_SCORE || (!r.感性 && !r.技術 && !r.討論)) return
     const d = n.發布時間 && !isNaN(Date.parse(n.發布時間)) ? new Date(n.發布時間) : new Date()
     items.push({
       時間: twTime(d),
@@ -419,6 +457,6 @@ export async function fetchNewsCandidates(): Promise<{ items: Candidate[]; scann
       技術: r.技術,
       討論: r.討論,
     })
-  }
-  return { items, scanned: slice.length }
+  })
+  return { items, scanned: picked.length }
 }
