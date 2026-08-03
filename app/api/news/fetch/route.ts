@@ -8,8 +8,8 @@ export const dynamic = 'force-dynamic'
 // 只抓候選回前端，不寫表
 export async function POST() {
   try {
-    const { items, scanned } = await fetchNewsCandidates()
-    return NextResponse.json({ ok: true, items, scanned })
+    const { items, scanned, report } = await fetchNewsCandidates()
+    return NextResponse.json({ ok: true, items, scanned, report })
   } catch (e) {
     // 額度用完是可預期的狀況，給前端看得懂的話，不要吐一整包 Groq 的原始 JSON
     if (e instanceof RateLimitError) {
