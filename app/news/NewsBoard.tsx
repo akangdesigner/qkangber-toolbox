@@ -1,14 +1,15 @@
 'use client'
 
 import { useState } from 'react'
-import type { Candidate } from '@/lib/news-fetch'
+import type { Candidate, FetchReport } from '@/lib/news-fetch'
 import type { PostedLog } from '@/lib/news'
 
 const typeColor: Record<string, string> = {
   'AI/LLM': 'bg-violet-500/15 text-violet-300 border-violet-500/30',
   台灣科技: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-  科技綜合: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+  '工程/開發': 'bg-sky-500/15 text-sky-300 border-sky-500/30',
   國際科技: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+  政府一手: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
 }
 
 type VKey = '感性' | '技術' | '討論'
@@ -17,6 +18,7 @@ const VARIANTS: { key: VKey; label: string }[] = [
   { key: '技術', label: '技術短知識' },
   { key: '討論', label: '觸發討論' },
 ]
+const emptyDrafts = (): Record<VKey, string> => ({ 感性: '', 技術: '', 討論: '' })
 
 const stripUrls = (s: string) =>
   (s || '').replace(/https?:\/\/\S+/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
@@ -29,10 +31,12 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [tab, setTab] = useState<Record<string, VKey>>({})
   const [withImg, setWithImg] = useState<Record<string, boolean>>({})
   const [busy, setBusy] = useState<string | null>(null)
+  const [writing, setWriting] = useState<string | null>(null) // 正在生草稿的 `連結|風格`
   const [copied, setCopied] = useState<string | null>(null)
   const [saving, setSaving] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
+  const [report, setReport] = useState<FetchReport | null>(null)
   const [lang, setLang] = useState<'all' | 'zh' | 'en'>('all')
   const [posted, setPosted] = useState<PostedLog[]>(history)
 
@@ -47,12 +51,10 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
       if (res.ok && json.ok) {
         const items: Candidate[] = json.items || []
         setCandidates(items)
-        setDrafts(Object.fromEntries(items.map((c) => [c.原文連結, { 感性: stripUrls(c.感性), 技術: stripUrls(c.技術), 討論: stripUrls(c.討論) }])))
+        setReport(json.report ?? null)
+        setDrafts(Object.fromEntries(items.map((c) => [c.原文連結, emptyDrafts()])))
         setTab(Object.fromEntries(items.map((c) => [c.原文連結, '感性' as VKey])))
         setWithImg(Object.fromEntries(items.map((c) => [c.原文連結, c.配圖 === '是' && !!c.圖片連結])))
-        if (items.length === 0) alert(`掃了 ${json.scanned} 則，兩天內沒有新的夠分（或都發過了）。`)
-      } else if (json.rateLimited) {
-        alert(`${json.error}\n\n（Groq 免費版每天 100k token，站上所有 AI 功能共用。）`)
       } else {
         alert('抓取失敗：' + (json.error || res.status))
       }
@@ -60,6 +62,34 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
       alert('抓取失敗：' + e)
     }
     setFetching(false)
+  }
+
+  // 草稿是點了才生的：一篇約 1.6k token，不會幫你沒看的新聞先寫三篇
+  async function write(c: Candidate, vkey: VKey, force = false) {
+    const id = c.原文連結
+    if (!force && drafts[id]?.[vkey]) return // 生過就直接用，切回來不重付一次
+    setWriting(`${id}|${vkey}`)
+    try {
+      const res = await fetch('/api/news/draft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 風格: vkey, 標題: c.標題, 來源: c.來源, 類型: c.類型, 摘要: c.摘要, 原文連結: c.原文連結 }),
+      })
+      const json = await res.json().catch(() => ({}))
+      if (res.ok && json.ok) {
+        setDrafts((d) => ({ ...d, [id]: { ...(d[id] ?? emptyDrafts()), [vkey]: stripUrls(json.內容) } }))
+      } else {
+        alert('產生草稿失敗：' + (json.error || res.status))
+      }
+    } catch (e) {
+      alert('產生草稿失敗：' + e)
+    }
+    setWriting(null)
+  }
+
+  function pickTab(c: Candidate, vkey: VKey) {
+    setTab((t) => ({ ...t, [c.原文連結]: vkey }))
+    void write(c, vkey)
   }
 
   async function publish(c: Candidate) {
@@ -167,6 +197,7 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
     const active = tab[id] ?? '感性'
     const text = drafts[id]?.[active] ?? ''
     const len = [...text].length
+    const isWriting = writing === `${id}|${active}`
     return (
       <article key={id} className="rounded-xl border border-white/10 bg-white/[0.03] overflow-hidden">
         <div className="lg:grid lg:grid-cols-2">
@@ -225,24 +256,50 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
               {VARIANTS.map((v) => (
                 <button
                   key={v.key}
-                  onClick={() => setTab((t) => ({ ...t, [id]: v.key }))}
-                  className={`px-3 py-1 rounded-full text-xs border transition-colors ${
+                  onClick={() => pickTab(c, v.key)}
+                  disabled={!!writing}
+                  className={`px-3 py-1 rounded-full text-xs border transition-colors disabled:opacity-50 ${
                     active === v.key ? 'bg-violet-600 border-violet-500 text-white' : 'bg-white/5 border-white/10 text-slate-400 hover:text-slate-200'
                   }`}
                 >
                   {v.label}
+                  {drafts[id]?.[v.key] ? '' : ' ＋'}
                 </button>
               ))}
             </div>
-            <textarea
-              value={text}
-              onChange={(e) => setDrafts((d) => ({ ...d, [id]: { ...d[id], [active]: e.target.value } }))}
-              rows={9}
-              className="w-full rounded-lg bg-black/30 border border-white/10 px-3 py-2 text-sm text-slate-200 leading-relaxed outline-none focus:border-violet-400 resize-y"
-              placeholder="貼文草稿…"
-            />
+            {isWriting ? (
+              <div className="h-[13.5rem] rounded-lg bg-black/30 border border-white/10 flex items-center justify-center text-sm text-slate-500">
+                正在寫「{VARIANTS.find((v) => v.key === active)?.label}」…
+              </div>
+            ) : text ? (
+              <textarea
+                value={text}
+                onChange={(e) => setDrafts((d) => ({ ...d, [id]: { ...d[id], [active]: e.target.value } }))}
+                rows={9}
+                className="w-full rounded-lg bg-black/30 border border-white/10 px-3 py-2 text-sm text-slate-200 leading-relaxed outline-none focus:border-violet-400 resize-y"
+                placeholder="貼文草稿…"
+              />
+            ) : (
+              <button
+                onClick={() => write(c, active)}
+                disabled={!!writing}
+                className="h-[13.5rem] w-full rounded-lg bg-black/30 border border-dashed border-white/15 hover:border-violet-400/50 hover:bg-black/40 disabled:opacity-50 text-sm text-slate-400"
+              >
+                點這裡產生「{VARIANTS.find((v) => v.key === active)?.label}」草稿
+                <span className="block mt-1 text-xs text-slate-600">草稿是按了才生的，不會先幫每則都寫三篇</span>
+              </button>
+            )}
             <div className="flex items-center gap-2 mt-2">
               <span className={`text-xs ${len > 500 ? 'text-red-400' : 'text-slate-500'}`}>{len}/500</span>
+              {text && (
+                <button
+                  onClick={() => write(c, active, true)}
+                  disabled={!!writing}
+                  className="text-xs text-slate-500 hover:text-slate-300 disabled:opacity-50"
+                >
+                  重寫一篇
+                </button>
+              )}
               <button
                 onClick={() => publish(c)}
                 disabled={isBusy || len === 0 || len > 500}
@@ -250,7 +307,11 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
               >
                 {isBusy ? '發送中…' : '發這則'}
               </button>
-              <button onClick={() => copy(c)} className="rounded-lg bg-white/5 hover:bg-white/10 px-3 py-1.5 text-sm text-slate-300">
+              <button
+                onClick={() => copy(c)}
+                disabled={len === 0}
+                className="rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 px-3 py-1.5 text-sm text-slate-300"
+              >
                 {copied === id ? '已複製 ✓' : '複製'}
               </button>
               <button onClick={() => skip(c)} disabled={isBusy} className="rounded-lg bg-white/5 hover:bg-white/10 disabled:opacity-50 px-3 py-1.5 text-sm text-slate-500">
@@ -271,7 +332,7 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
           disabled={fetching}
           className="rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 px-4 py-1.5 text-sm font-medium text-white"
         >
-          {fetching ? '抓取中…（約 1 分鐘）' : '抓最新新聞'}
+          {fetching ? '抓取中…（約 1-2 分鐘）' : '抓最新新聞'}
         </button>
         {candidates.length > 0 && (
           <div className="flex gap-1.5">
@@ -293,6 +354,27 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
           </div>
         )}
       </div>
+
+      {report && (
+        <div className="rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3 text-xs text-slate-400 space-y-2">
+          <p>
+            抓到 {report.抓到} 則 → 標題去重剩 {report.去重後} → 送 AI 評分 {report.送打分} → 留下{' '}
+            <span className="text-slate-200">{candidates.length}</span> 則
+            {report.低分 > 0 && `（${report.低分} 則分數不夠`}
+            {report.低分 > 0 && report.名額外 > 0 && '，'}
+            {report.低分 === 0 && report.名額外 > 0 && '（'}
+            {report.名額外 > 0 && `${report.名額外} 則夠分但排不進名額`}
+            {(report.低分 > 0 || report.名額外 > 0) && '）'}
+          </p>
+          <p className="flex flex-wrap gap-x-3 gap-y-1">
+            {report.來源.map((s) => (
+              <span key={s.名稱} className={s.狀態 === 'ok' ? 'text-slate-500' : 'text-amber-400'}>
+                {s.名稱} {s.狀態 === 'ok' ? `${s.收下} 則` : s.狀態}
+              </span>
+            ))}
+          </p>
+        </div>
+      )}
 
       {candidates.length === 0 && (
         <p className="text-sm text-slate-500">按「抓最新新聞」開始。候選只留在這頁，重新整理就會清掉；發出去的會記在下方。</p>

@@ -19,9 +19,8 @@ export type Candidate = {
   圖片連結: string
   配圖: string
   摘要: string
-  感性: string
-  技術: string
-  討論: string
+  // 三種風格的草稿不在這裡生。使用者在前端點了風格才呼叫 /api/news/draft，
+  // 避免幫沒人要看的新聞先寫三篇（一篇約 1.6k token）。
 }
 
 const MAX_AGE_DAYS = 2 // 預設：超過兩天的新聞不收（單一來源可用 maxAgeDays 覆寫）
@@ -121,14 +120,13 @@ const HN_LIMIT = 6
 // 中文來源永遠輪不到，所以抓回來的全是英文。
 // SCAN_CAP 跟來源數綁在一起：33 條來源輪流取，20 個名額等於一半的來源分不到任何一則。
 const SCAN_CAP = 64 // 進第一階段打分的則數（33 條來源 × 約 2 則）
-// 進第二階段寫草稿的則數。這段是花錢的地方（一則約 1800 token 生成），
-// 原本設 8 是為了閃 Groq 免費額度；改走 OpenRouter 之後變成純成本取捨，
-// 而 64 則進來時 8 個名額太緊——實測 39 則過了門檻、31 則拿不到名額。
-const WRITE_CAP = 14
+// 進第二階段寫摘要的則數。草稿移到前端點了才生之後，這段從 1800 token 縮到 500，
+// 同樣的錢可以多看兩倍——所以名額從 8（閃 Groq 免費額度的舊值）開到 20。
+const WRITE_CAP = 20
 // 第一階段同時打幾批。Groq 的 TPM 是滾動視窗，一次噴 4 批（約 1 萬 token）容易撞上限；
 // 開 2 批是把同樣的量攤平在幾秒內送完，整輪只慢幾秒。
 const SCORE_CONCURRENCY = 2
-const REWRITE_CONCURRENCY = 6 // 第二階段（寫稿）同時幾則：14 則分三輪打完，整輪不會比原本慢太多
+const REWRITE_CONCURRENCY = 6 // 第二階段（寫摘要）同時幾則：20 則分四輪打完
 const MIN_SCORE = 6
 
 // 兩階段的省錢邏輯不在「換小模型」，而在「量」：
@@ -152,30 +150,18 @@ const SCORE_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐�
 回傳 JSON：{"結果":[{"編號":1,"分數":8}]}
 每一則都要回，編號要跟我給的一致，不可省略或合併。不要寫任何理由。只回 JSON。`
 
-const SYSTEM_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一則科技新聞，請判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值，並針對它寫三種不同風格的 Threads 貼文。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要、感性、技術、討論。
+// 第二階段只寫摘要，不寫貼文草稿。草稿改成前端點了才呼叫 /api/news/draft，
+// 所以這裡從 1800 token 縮到 500，同樣的預算可以多看兩倍的新聞。
+const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一則科技新聞，請判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值，並寫一段摘要。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要。
 
 分數是 0 到 10 的整數，代表這則新聞的分享價值：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。
-特例：分類是「政府一手」時這是公告不是新聞，有明確申請對象、補助金額或截止日的給 7 分以上；純徵才、內部行政、得獎名單給 2 分。這類的摘要要寫清楚「誰可以申請、什麼時候截止、給多少」。
+特例：分類是「政府一手」時這是公告不是新聞，有明確申請對象、補助金額或截止日的給 7 分以上；純徵才、內部行政、得獎名單給 2 分。
 
 摘要：用繁體中文 200 到 300 字說明這則新聞，先講發生了什麼事、再補重點細節與背景、最後帶為什麼值得關注，分 2 到 3 段寫清楚來龍去脈，讓人不點原文也能完整看懂（英文新聞也要翻成中文摘要）。
+分類是「政府一手」時，摘要要寫清楚「誰可以申請、什麼時候截止、給多少」，這比背景重要。
+不可以只把標題換句話說；我給的原始摘要很短甚至空白時，就用你對這個領域的常識補背景，但不可以編造數字、日期或引述。
 
-【貼文要寫得像一個有想法的真人在發 Threads，不是新聞小編在交差。三個鐵則】
-1. 一定要有具體的錨點：一個明確的角度、一個真實的數字或細節、一段自己的經驗。不要空泛地講「這很重要」「值得關注」。
-2. 一定要有自己的立場：敢講真話、敢吐槽、敢承認自己也不確定，不要中立到像維基百科。
-3. 白話到底：像在跟朋友講話，術語一律翻成人話。
-
-下面是「語氣」（不是主題）的示範，請學這種真實、有觀點、不做作的口吻，但內容必須扣住我給你的這則新聞：
-範例一（條列知識的口吻——直、白話、敢講不討喜的真話）：「29歲的初級大人給社會新鮮人的建議：1. 防曬一定要擦 2. 一定要用牙線 …… 8. 不要神化任何人，之後你會發現大部分的成功人士其實都蠻混蛋的」
-範例二（感性的口吻——從一個具體的私人錨點切入，帶出真實的時間轉折與體悟）：「幾年前拜讀張西的書，那時候特別喜歡一句話……以前覺得這行字只適用於無疾而終的人際關係。沒想到多年後，自己在做 AI 的時候，這句話會重新在腦海裡放大……」
-
-三種貼文共同規則：繁體中文、150 到 400 字、提到 AI 時用「它」、貼文內文不要放任何網址或連結。排版符合 Threads 閱讀習慣：分成 2 到 4 個短段落、段落間空一行；emoji 整篇 0 到 2 個就好，別硬塞。
-- 感性：第一人稱，從一個具體的私人錨點切入（自己的一段經驗、當下的一個感受、曾經的一個想法），再連到這則新聞，最後收一個誠實、不喊口號的體悟，像範例二那種真實的轉折感。
-- 技術：挑這則新聞背後的一個技術點或名詞，用白話講給不懂的人聽，講清楚「它在解決什麼問題」而不是堆規格；帶一句自己的判斷（這招高明在哪／哪裡其實沒那麼神）。短而有料，看完真的學到一個概念。
-- 討論：拋出一個有立場的看法或一個真實的兩難，引導讀者留言，結尾用一個具體的開放式問句（不要「你怎麼看？」這種空問句，要問得具體）。
-
-嚴禁：業配腔、AI 腔、做作的比喻、硬湊的排比、為了正能量而正能量的結尾、把新聞重講一遍卻沒有自己的觀點，以及「在這個＿＿的時代」「不禁讓人深思」「值得我們關注」這類空話。
-
-若分數低於我在訊息裡給你的「過稿門檻」，感性、技術、討論三個欄位都給空字串。只回 JSON。`
+只回 JSON。`
 
 function strip(s: string): string {
   return (s || '')
@@ -423,7 +409,7 @@ function dedupeByTitle(items: Parsed[]): Parsed[] {
   return kept
 }
 
-type Drafts = { 分數: number; 摘要: string; 感性: string; 技術: string; 討論: string }
+type Summary = { 分數: number; 摘要: string }
 
 // 撞到 token 上限要讓前端講清楚，不能跟「今天沒新聞」長得一樣。
 // 訊息不要寫死是哪一家：實際打的是 OpenRouter 還是 Groq，要看 OPENROUTER_API_KEY 有沒有設。
@@ -468,23 +454,17 @@ async function scoreBatch(batch: Parsed[], offset: number): Promise<Map<number, 
   return out
 }
 
-// 第二階段：只有過門檻的才走到這裡，用 70B 寫摘要＋3 草稿
-async function rewrite(n: Parsed): Promise<Drafts | null> {
+// 第二階段：只有過門檻的才走到這裡，寫 200-300 字摘要（貼文草稿留給前端點了才生）
+async function summarize(n: Parsed): Promise<Summary | null> {
   const raw = await chatJSON(
-    SYSTEM_PROMPT,
-    `標題:${n.標題}\n來源:${n.來源}\n分類:${n.類型}\n摘要:${n.摘要}\n原文連結:${n.原文連結}\n過稿門檻:${n.門檻 ?? MIN_SCORE}`,
-    1800,
-    0.6
+    SUMMARY_PROMPT,
+    `標題:${n.標題}\n來源:${n.來源}\n分類:${n.類型}\n摘要:${n.摘要}\n原文連結:${n.原文連結}`,
+    500,
+    0.5
   )
   try {
-    const r = JSON.parse(raw) as { 分數?: number; 摘要?: string; 感性?: string; 技術?: string; 討論?: string }
-    return {
-      分數: Number(r.分數 ?? 0),
-      摘要: String(r.摘要 ?? ''),
-      感性: String(r.感性 ?? ''),
-      技術: String(r.技術 ?? ''),
-      討論: String(r.討論 ?? ''),
-    }
+    const r = JSON.parse(raw) as { 分數?: number; 摘要?: string }
+    return { 分數: Number(r.分數 ?? 0), 摘要: String(r.摘要 ?? '') }
   } catch {
     return null
   }
@@ -659,13 +639,13 @@ export async function fetchNewsCandidates(): Promise<{
     return true
   })
 
-  // 第二階段：只有過門檻的才用 70B 寫摘要＋3 草稿
-  const written = await inBatches(resolved, rewrite, REWRITE_CONCURRENCY)
+  // 第二階段：只有過門檻的才寫摘要
+  const written = await inBatches(resolved, summarize, REWRITE_CONCURRENCY)
 
   const items: Candidate[] = []
   resolved.forEach((n, i) => {
     const r = written[i]
-    if (!r || r.分數 < (n.門檻 ?? MIN_SCORE) || (!r.感性 && !r.技術 && !r.討論)) return
+    if (!r || r.分數 < (n.門檻 ?? MIN_SCORE) || !r.摘要) return
     const d = n.發布時間 && !isNaN(Date.parse(n.發布時間)) ? new Date(n.發布時間) : new Date()
     items.push({
       時間: twTime(d),
@@ -677,9 +657,6 @@ export async function fetchNewsCandidates(): Promise<{
       圖片連結: n.圖片連結,
       配圖: n.圖片連結 ? '是' : '否',
       摘要: r.摘要,
-      感性: r.感性,
-      技術: r.技術,
-      討論: r.討論,
     })
   })
   return {
