@@ -360,9 +360,9 @@ export default function WatchBoard() {
   }
   const heldSet = new Set(papers.map((p) => p.symbol))
 
-  // 逆風判定：mood 偏空「或」加權跌破季線就算（2y 回測：大盤在季線下時，高分股 20 日平均 -2%、
-  // 連「接近買點」都只剩 5 天反彈力——季線是硬條件，不是參考）
-  const headwind = market?.mood === 'bearish' || market?.indices?.find((i) => i.key === 'twii')?.aboveMa60 === false
+  // 逆風＝大盤那條進場判定擋下來（加權跌破季線／今日重挫／算不出季線）
+  // 2y 回測：大盤在季線下時，高分股 20 日平均 -2%、連「接近買點」都只剩 5 天反彈力——季線是硬條件，不是參考
+  const headwind = market ? market.entry === 'block' : false
 
   return (
     <main className="max-w-5xl mx-auto px-4 sm:px-6 py-12">
@@ -620,24 +620,68 @@ export default function WatchBoard() {
   )
 }
 
-// 大盤環境列：加權/費半/標普/VIX ＋ 偏多偏空總結（看天氣）
+// 大盤環境列：三條「各自回答不同問題」的判定 ＋ 四個指數的原始數字
+// 刻意不加總——加總會讓「破季線」被「費半平盤」抵銷，算出「季線下卻喊順風積極」的自相矛盾結論。
+// 每條都標註證據等級：有 2 年回測的才准擋你的動作，手寫門檻的只准調部位。
 function MarketBanner({ m }: { m: MarketOverview }) {
-  const moodCls =
-    m.mood === 'bullish' ? 'border-rose-500/40 bg-rose-500/[0.06] text-rose-300'
-    : m.mood === 'bearish' ? 'border-emerald-500/40 bg-emerald-500/[0.06] text-emerald-300'
-    : 'border-slate-500/30 bg-slate-500/[0.06] text-slate-300'
+  const blocked = m.entry === 'block'
   // VIX 是「跌=好」，方向色與其他指數相反
   const idxColor = (key: string, pct: number) => {
     const good = key === 'vix' ? pct < 0 : pct > 0
     return good ? 'text-rose-400' : 'text-emerald-400'
   }
+  const rows = [
+    {
+      q: '今天進不進場？',
+      a: blocked ? '不進場' : '可以看個股訊號',
+      text: m.entryText,
+      evidence: '2 年回測',
+      cls: blocked ? 'border-emerald-500/40 bg-emerald-500/[0.08] text-emerald-200' : 'border-rose-500/40 bg-rose-500/[0.08] text-rose-200',
+    },
+    {
+      q: '今天碰不碰電子？',
+      a: m.electronics === 'avoid' ? '避開電子' : m.electronics === 'watch' ? '電子保守' : '沒特別警訊',
+      text: m.electronicsText,
+      evidence: '2 年回測',
+      cls: m.electronics === 'avoid' ? 'border-amber-500/40 bg-amber-500/[0.08] text-amber-200'
+        : m.electronics === 'watch' ? 'border-amber-500/25 bg-amber-500/[0.04] text-amber-200/80'
+        : 'border-white/10 bg-white/[0.02] text-slate-300',
+    },
+    {
+      q: '部位開多大？',
+      a: m.sizing === 'reduce' ? '縮小部位' : '照 2% 風險規則',
+      text: m.sizingText,
+      evidence: '未經回測',
+      cls: m.sizing === 'reduce' ? 'border-amber-500/40 bg-amber-500/[0.08] text-amber-200' : 'border-white/10 bg-white/[0.02] text-slate-300',
+    },
+  ]
   return (
-    <div className={`mb-6 rounded-xl border p-4 ${moodCls}`}>
+    <div className={`mb-6 rounded-xl border p-4 ${blocked ? 'border-emerald-500/30 bg-emerald-500/[0.04]' : 'border-rose-500/30 bg-rose-500/[0.04]'}`}>
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-semibold">🌤 大盤環境</span>
-        <span className="rounded-md border border-white/20 px-2 py-0.5 text-xs font-medium">{m.moodLabel}</span>
+        <span className="text-sm font-semibold text-slate-200">🌤 大盤環境</span>
+        <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${blocked ? 'bg-emerald-500/20 text-emerald-200' : 'bg-rose-500/20 text-rose-200'}`}>
+          {m.moodLabel}
+        </span>
       </div>
-      <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm">
+
+      {/* 三條判定，各自獨立、不加總 */}
+      <div className="mt-3 space-y-1.5">
+        {rows.map((r) => (
+          <div key={r.q} className={`rounded-lg border px-3 py-2 ${r.cls}`}>
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className="text-[11px] text-slate-400">{r.q}</span>
+              <span className="text-sm font-semibold">{r.a}</span>
+              <span className={`ml-auto rounded px-1.5 py-0.5 text-[10px] ${r.evidence === '2 年回測' ? 'bg-white/10 text-slate-300' : 'bg-white/5 text-slate-500'}`}>
+                {r.evidence}
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-slate-400">{r.text}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* 原始數字：純資訊，標普不參與任何判定 */}
+      <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 border-t border-white/5 pt-3 text-sm">
         {m.indices.map((i) => (
           <div key={i.key} className="flex items-baseline gap-1.5">
             <span className="text-xs text-slate-400">{i.name}</span>
@@ -650,10 +694,10 @@ function MarketBanner({ m }: { m: MarketOverview }) {
                 {i.aboveMa60 ? '站上季線' : '破季線'}
               </span>
             )}
+            {i.key === 'gspc' && <span className="text-[10px] text-slate-600">不計入判定</span>}
           </div>
         ))}
       </div>
-      <p className="mt-3 text-xs leading-relaxed text-slate-300">{m.moodText}</p>
     </div>
   )
 }

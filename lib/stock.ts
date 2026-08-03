@@ -748,7 +748,15 @@ function round(n: number, digits = 2): number {
 export type IndexQuote = { key: string; name: string; price: number; changePct: number; aboveMa60: boolean | null; note?: string }
 export type MarketOverview = {
   indices: IndexQuote[]
-  mood: 'bullish' | 'neutral' | 'bearish'
+  // 三條獨立判定，各自回答不同問題，「不加總」——加總會讓「破季線(-2)」被「費半平盤(+1.5)」抵銷掉，
+  // 產生「加權在季線下卻喊順風積極」這種自相矛盾的結論（2026-08-03 就是這樣算出來的）。
+  entry: 'ok' | 'block' // 今天進不進場（唯一有 2 年回測的規則：加權季線）
+  entryText: string
+  electronics: 'ok' | 'watch' | 'avoid' // 今天碰不碰電子（費半重挫，有 2 年回測；只往下判、不往上判）
+  electronicsText: string
+  sizing: 'normal' | 'reduce' // 部位開多大（VIX；門檻是手寫的，未經回測，故只影響部位不影響進出）
+  sizingText: string
+  mood: 'bullish' | 'neutral' | 'bearish' // 相容欄位：由上面三條推導，不再是加總分數
   moodLabel: string // 環境偏多/中性/偏空
   moodText: string // 一句話總結
   soxCorr20: number | null // 近20組「費半當日→加權隔日」相關係數（<0.25 視為脫鉤，費半警訊自動降權）
@@ -823,52 +831,66 @@ export async function getMarketOverview(): Promise<MarketOverview> {
   }
   // 算不出連動度就當「有連動」（保守預設：寧可多警告，不要少警告）
   const soxDecoupled = soxCorr20 != null && soxCorr20 < 0.25
-  const soxW = soxDecoupled ? 0.5 : 1
 
-  let pts = 0
-  if (twii) {
-    pts += twii.aboveMa60 ? 2 : twii.aboveMa60 === false ? -2 : 0 // 趨勢：季線之上/之下
-    // 今日漲跌「看幅度」：重挫日要扣得夠重，不能跟小跌一樣只扣 1（否則綠油油還喊偏多）
-    const p = twii.changePct
-    pts += p >= 1.5 ? 2 : p > 0.3 ? 1 : p >= -0.3 ? 0 : p > -1.5 ? -1.5 : p > -3 ? -2.5 : -3.5
-  }
-  // 費半對台股電子最關鍵，且要看「幅度」不能只看紅黑（回測近2年劑量效應明確：跌越深電子隔日越弱）
-  // 但 2026/06–07 回放發現脫鉤期會失靈，故乘上連動度權重 soxW（脫鉤時減半）
-  if (sox) {
-    const sp = sox.changePct
-    pts += (sp > 0 ? 1.5 : sp > -1.5 ? -1 : sp > -3 ? -2.5 : -3.5) * soxW
-  }
-  if (gspc) pts += gspc.changePct > 0 ? 0.5 : -0.5
-  if (vix) {
-    pts += vix.price < 16 ? 1 : vix.price > 25 ? -1.5 : 0 // 絕對水位
-    pts += vix.changePct >= 15 ? -1.5 : vix.changePct >= 7 ? -1 : 0 // 跳升＝恐慌升溫，光看水位會漏掉
-  }
-  let mood: MarketOverview['mood'] = pts >= 2 ? 'bullish' : pts <= -2 ? 'bearish' : 'neutral'
-  // 保護：大盤今天自己重挫，就絕不喊「順風積極」——在綠油油的崩盤日叫新手加碼最傷
+  // ===== 判定一：今天進不進場 =====
+  // 唯一有 2 年回測撐的規則——大盤在季線之下時，高總分股 20 日平均 -2%，連「接近買點」都只剩幾天反彈力。
+  // 加上「今日自己重挫」的保護：在崩盤日叫新手進場最傷。算不出季線時保守擋掉，不放行。
   const dayDrop = twii ? twii.changePct : 0
-  if (dayDrop <= -2 && mood === 'bullish') mood = 'neutral'
-  if (dayDrop <= -3) mood = 'bearish'
-  // 費半重挫日也不准喊順風（電子占台股權重太高）——但近期明顯脫鉤時不強制，避免一直誤擋
-  if (sox && sox.changePct <= -3 && mood === 'bullish' && !soxDecoupled) mood = 'neutral'
-  const moodLabel = mood === 'bullish' ? '環境偏多' : mood === 'bearish' ? '環境偏空' : '環境中性'
-  const reasons: string[] = []
-  if (twii) {
-    reasons.push(twii.aboveMa60 ? '加權站上季線' : twii.aboveMa60 === false ? '加權跌破季線' : '加權方向不明')
-    if (dayDrop <= -2) reasons.push(`加權今日重挫 ${Math.abs(twii.changePct)}%`)
-    else if (twii.changePct >= 2) reasons.push(`加權今日大漲 ${twii.changePct}%`)
-  }
-  if (sox) {
-    const corrNote = soxCorr20 == null ? '' : soxDecoupled ? `（近20日與台股連動偏低 r=${soxCorr20}，警訊參考就好）` : `（近20日連動度 r=${soxCorr20}）`
-    if (sox.changePct <= -3) reasons.push(`費半重挫 ${Math.abs(sox.changePct)}%——${soxDecoupled ? '電子股留意' : '⚠️ 電子股今日保守（歷史上費半重挫後，電子隔日明顯偏弱）'}${corrNote}`)
-    else if (sox.changePct <= -1.5) reasons.push(`費半大跌 ${Math.abs(sox.changePct)}%，電子股保守${corrNote}`)
-    else reasons.push(sox.changePct >= 0 ? '費半收紅' : '費半收黑')
-  }
-  if (vix) reasons.push(vix.changePct >= 7 ? `VIX 跳升 ${vix.changePct}%` : vix.price < 16 ? 'VIX 平靜' : vix.price > 25 ? 'VIX 偏高' : 'VIX 中性')
-  const moodText =
-    (mood === 'bullish' ? '大環境順風，操作可積極些；' : mood === 'bearish' ? '大環境逆風，做多保守、控制部位、今天別追高；' : '大環境中性，個股表現為主，盤勢震盪別追高；') +
-    reasons.join('、') + '。'
+  const twiiUnknown = !twii || twii.aboveMa60 == null
+  // 距季線 %：講「破季線」不夠，要講破多深，才知道是剛跌破還是已經跌很久
+  const twiiCloses = rawCandles['twii']?.map((c) => c.close) ?? []
+  const twiiMa60 = twiiCloses.length >= 60 ? sma(twiiCloses, 60) : null
+  const twiiDistPct = twii && twiiMa60 ? round(((twii.price - twiiMa60) / twiiMa60) * 100, 1) : null
+  const entry: MarketOverview['entry'] = twiiUnknown || twii!.aboveMa60 === false || dayDrop <= -3 ? 'block' : 'ok'
+  const entryText = twiiUnknown
+    ? '加權季線算不出來（資料不足）——當作不進場處理。'
+    : twii!.aboveMa60 === false
+      ? `加權跌破季線${twiiDistPct == null ? '' : `（距季線 ${twiiDistPct}%）`}——波段買進訊號此時失效，今天不進場。2 年回測：大盤在季線下時，高總分股 20 日平均轉負。`
+      : dayDrop <= -3
+        ? `加權今日重挫 ${Math.abs(dayDrop)}%——雖然還在季線上，但崩盤當天不進場，等它站穩。`
+        : '加權站上季線——大盤這關過了，可以看個股自己的訊號決定進不進場。'
 
-  const data: MarketOverview = { indices, mood, moodLabel, moodText, soxCorr20, asOf: new Date().toISOString() }
+  // ===== 判定二：今天碰不碰電子 =====
+  // 只往下判、不往上判：費半重挫→電子隔日偏弱（2 年回測劑量效應明確）；
+  // 費半收紅→台股會漲則毫無證據（r² 僅一成多），所以上漲側一律不給任何加分。
+  const corrNote = soxCorr20 == null ? '' : `（近20日與加權隔日連動 r=${soxCorr20}${soxDecoupled ? '，已脫鉤、警訊降級' : ''}）`
+  let electronics: MarketOverview['electronics'] = 'ok'
+  let electronicsText = '費半沒有重挫——這一關沒有話要說。注意：費半收紅不構成做多理由，它只能扣分不能加分。'
+  if (sox && sox.changePct <= -3) {
+    electronics = soxDecoupled ? 'watch' : 'avoid'
+    electronicsText = soxDecoupled
+      ? `費半重挫 ${Math.abs(sox.changePct)}%，但近期與台股脫鉤${corrNote}——電子股留意即可，不強制避開。`
+      : `⚠️ 費半重挫 ${Math.abs(sox.changePct)}%——今天避開電子股。2 年回測：費半重挫後電子隔日明顯偏弱${corrNote}。`
+  } else if (sox && sox.changePct <= -1.5) {
+    electronics = 'watch'
+    electronicsText = `費半大跌 ${Math.abs(sox.changePct)}%——電子股今天保守一點${corrNote}。`
+  }
+
+  // ===== 判定三：部位開多大 =====
+  // VIX 門檻是手寫的、沒有回測，所以只准影響「部位大小」，不准影響「進不進場」。標普純顯示，不參與判定。
+  const sizing: MarketOverview['sizing'] = vix && (vix.price > 25 || vix.changePct >= 7) ? 'reduce' : 'normal'
+  const sizingText = !vix
+    ? 'VIX 抓不到，部位照原本的 2% 風險規則走。'
+    : sizing === 'reduce'
+      ? `VIX ${vix.price}${vix.changePct >= 7 ? `、今日跳升 ${vix.changePct}%` : ''}——恐慌升溫，部位縮小、停損拉緊。（此門檻未經回測，僅供調節部位）`
+      : `VIX ${vix.price}，市場情緒平穩——部位照原本的 2% 風險規則走，不因此加碼。（此門檻未經回測）`
+
+  // 相容欄位：由三條判定推導，不再是加總分數。headwind 判定與訊號日誌都靠它。
+  const mood: MarketOverview['mood'] = entry === 'block' ? 'bearish' : electronics === 'avoid' || sizing === 'reduce' ? 'neutral' : 'bullish'
+  const moodLabel = entry === 'block' ? '不進場' : mood === 'neutral' ? '可進場（有但書）' : '可進場'
+  const moodText =
+    (entry === 'block' ? '❌ 今天不進場：' : '✅ 大盤這關過了：') + entryText +
+    (electronics === 'ok' ? '' : ' ' + electronicsText) +
+    (sizing === 'reduce' ? ' ' + sizingText : '')
+
+  const data: MarketOverview = {
+    indices,
+    entry, entryText,
+    electronics, electronicsText,
+    sizing, sizingText,
+    mood, moodLabel, moodText, soxCorr20,
+    asOf: new Date().toISOString(),
+  }
   if (indices.length) marketCache = { data, at: Date.now() }
   return data
 }
