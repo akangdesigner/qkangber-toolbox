@@ -20,6 +20,7 @@ type Article = {
   title: string
   titleZh: string
   summary: string
+  worth: boolean
   worthNote: string
   url: string
   discussionUrl: string
@@ -344,9 +345,21 @@ function ArticleTab() {
           <div
             key={article.discussionUrl}
             className="rounded-2xl px-5 py-4"
-            style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}
+            style={{
+              background: article.worth ? 'rgba(139,92,246,0.05)' : 'rgba(255,255,255,0.02)',
+              border: article.worth ? '1px solid rgba(139,92,246,0.25)' : '1px solid rgba(255,255,255,0.06)',
+              opacity: article.worth ? 1 : 0.7,
+            }}
           >
             <div className="flex items-center gap-2 mb-2">
+              {article.worth && (
+                <span
+                  className="px-2 py-0.5 rounded-full text-xs font-medium"
+                  style={{ background: 'rgba(251,191,36,0.15)', color: '#fbbf24' }}
+                >
+                  ⭐ 值得寫
+                </span>
+              )}
               <span
                 className="px-2 py-0.5 rounded-full text-xs"
                 style={{

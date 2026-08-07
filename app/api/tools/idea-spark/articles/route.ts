@@ -16,6 +16,7 @@ type Article = {
   title: string
   titleZh: string
   summary: string
+  worth: boolean
   worthNote: string
   url: string
   discussionUrl: string
@@ -89,7 +90,7 @@ async function gatherMaterials(hits: SourceHit[]): Promise<Material[]> {
 async function translateAndJudge(
   hits: SourceHit[],
   materials: Material[]
-): Promise<{ titleZh: string; summary: string; worthNote: string }[]> {
+): Promise<{ titleZh: string; summary: string; worth: boolean; worthNote: string }[]> {
   const client = getGroqClient()
   const list = hits
     .map((h, i) => {
@@ -112,26 +113,30 @@ async function translateAndJudge(
 對輸入的每一項，輸出：
 - titleZh：15–25 字中文標題，照原文語氣翻，不要下標題黨
 - summary：60–100 字摘要，講這篇文章的核心論點是什麼、作者站在什麼立場。沒有「網站簡介」或「內文摘錄」時一律留空字串，不要憑標題編造內容。
-- worthNote：一句完整的話（25–45 字），先給值不值得翻/寫的判斷，再給具體切角度建議。
+- worth：布林值，值不值得翻/寫成中文文章
+- worthNote：一句完整的話（25–45 字），先給值不值得翻/寫的判斷（呼應 worth），再給具體切角度建議。
 
-判斷標準：
-- 純技術新聞（新版本發布、公司併購、募資新聞）沒有觀點好切，判「不值得」
-- 純英文圈的內部梗／時事（美國政治、特定社群八卦）台灣讀者沒共鳴，判「不值得」
-- 有明確論點、方法論、或作者踩坑心得的文章，才判「值得」
+worth 判斷標準：
+- 純技術新聞（新版本發布、公司併購、募資新聞）沒有觀點好切，worth: false
+- 純英文圈的內部梗／時事（美國政治、特定社群八卦）台灣讀者沒共鳴，worth: false
+- 有明確論點、方法論、或作者踩坑心得的文章，才 worth: true
+- 沒有材料（summary 留空）判斷不了，一律 worth: false，不要用標題硬猜
 
 切角度要具體指名，不能是空話：講清楚可以用什麼台灣場景對比、延伸哪個反方論點、或補一個原文沒講的案例；不能寫成「可以結合在地案例探討」這種誰套都成立的句子。
 
 沒有材料（summary 留空）的項目，worthNote 就老實寫「材料不足，先點進去看內文再判斷」，不要硬掰角度。
 
 只回傳 JSON，順序跟輸入完全一致：
-{"items":[{"titleZh":"...","summary":"...","worthNote":"..."}, ...]}`,
+{"items":[{"titleZh":"...","summary":"...","worth":true,"worthNote":"..."}, ...]}`,
       },
       { role: 'user', content: list },
     ],
   })
   const raw = completion.choices[0]?.message?.content ?? '{}'
   try {
-    const parsed = JSON.parse(raw) as { items?: { titleZh: string; summary: string; worthNote: string }[] }
+    const parsed = JSON.parse(raw) as {
+      items?: { titleZh: string; summary: string; worth: boolean; worthNote: string }[]
+    }
     return parsed.items ?? []
   } catch {
     console.error('[idea-spark/articles] AI 回傳無法解析，長度', raw.length, '結尾', raw.slice(-80))
@@ -169,6 +174,7 @@ export async function GET() {
         title: h.title,
         titleZh: annotations[i]?.titleZh ?? h.title,
         summary: annotations[i]?.summary ?? '',
+        worth: annotations[i]?.worth ?? false,
         worthNote: annotations[i]?.worthNote ?? '',
         url: h.url ?? h.discussionUrl,
         discussionUrl: h.discussionUrl,
@@ -177,8 +183,8 @@ export async function GET() {
         createdAt: h.created_at,
         hasMaterial: materials[i].hasMaterial,
       }))
-      // 抓不到素材的判斷是硬猜的，往後擺；同組內維持原本排序（熱度）
-      .sort((a, b) => Number(b.hasMaterial) - Number(a.hasMaterial))
+      // 值得寫的排最前面；同組內抓不到素材的往後擺；再用熱度排序
+      .sort((a, b) => Number(b.worth) - Number(a.worth) || Number(b.hasMaterial) - Number(a.hasMaterial) || b.points - a.points)
       .map(({ hasMaterial: _hasMaterial, ...article }) => article)
 
     cache = { data: articles, expires: Date.now() + CACHE_TTL }
