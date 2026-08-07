@@ -1,18 +1,9 @@
 import { NextResponse } from 'next/server'
 import { getGroqClient, GROQ_MODEL } from '@/lib/groq'
+import { fetchMetaDescription, cleanStoryText, type HNHit } from '@/lib/hn-fetch'
 
 // 創業靈感雷達：抓 Hacker News 的 Show HN（獨立開發者秀自己做的產品），
 // 用 AI 意譯成中文＋補一句「可以怎麼延伸」的靈感筆記。
-
-type HNHit = {
-  objectID: string
-  title: string
-  url: string | null
-  points: number
-  num_comments: number
-  created_at: string
-  story_text?: string | null // 作者自己在 HN 貼的介紹，官網沒 meta 時靠它
-}
 
 type Idea = {
   title: string
@@ -29,75 +20,6 @@ type Idea = {
 type CacheEntry = { data: Idea[]; expires: number }
 const cache = new Map<string, CacheEntry>()
 const CACHE_TTL = 30 * 60 * 1000 // 30 分鐘，避免每次刷新都重打 HN + Groq
-
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
-const META_FETCH_TIMEOUT = 3500
-const MAX_HTML_BYTES = 150_000
-
-// 只翻標題常常看不出產品在幹嘛，所以去抓官網的 meta description 當作 AI 寫說明的素材。
-// 抓失敗或抓不到就回空字串，AI 會退回只憑標題推測。
-async function fetchMetaDescription(url: string): Promise<string> {
-  try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), META_FETCH_TIMEOUT)
-    const res = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': UA }, redirect: 'follow' })
-    clearTimeout(timer)
-    if (!res.ok || !res.body) return ''
-
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let html = ''
-    let bytes = 0
-    while (bytes < MAX_HTML_BYTES) {
-      const { done, value } = await reader.read()
-      if (done) break
-      bytes += value.byteLength
-      html += decoder.decode(value, { stream: true })
-      if (/<\/head>/i.test(html)) break
-    }
-    reader.cancel().catch(() => {})
-
-    const match =
-      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i) ||
-      html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i) ||
-      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i) ||
-      html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i)
-    if (!match) return ''
-    const text = match[1]
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      // GitHub 的罐頭描述，留著只會讓 AI 以為產品在講 GitHub
-      .replace(/Contribute to [\w.-]+\/[\w.-]+ development by creating an account on GitHub\.?/gi, '')
-      .replace(/\s*-\s*[\w.-]+\/[\w.-]+$/, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-    return text.length < 15 ? '' : text.slice(0, 300)
-  } catch {
-    return ''
-  }
-}
-
-// 作者在 HN 貼文裡自己寫的介紹。官網常常沒有 meta description（個人部落格、GitHub Pages），
-// 這段是補位來源，而且通常比官網文案更直白講清楚在解決什麼問題。
-function cleanStoryText(raw: string | null | undefined): string {
-  if (!raw) return ''
-  const text = raw
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&#x2F;/gi, '/')
-    .replace(/&#x27;/gi, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    // 開頭的招呼語（Hi HN!／Hello HN,／Hey there!）對理解產品沒幫助
-    .replace(/^\s*(hi|hey|hello|greetings)[\s,!]*(hn|there|all|everyone|folks)?[\s,!—-]*/i, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return text.length < 15 ? '' : text.slice(0, 400)
-}
 
 async function fetchShowHN(query: string): Promise<HNHit[]> {
   const params = new URLSearchParams()
