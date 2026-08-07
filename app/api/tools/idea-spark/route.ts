@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getGroqClient, GROQ_MODEL } from '@/lib/groq'
+import { chatJSON } from '@/lib/llm-json'
 import { fetchMetaDescription, cleanStoryText, type HNHit } from '@/lib/hn-fetch'
 
 // 創業靈感雷達：抓 Hacker News 的 Show HN（獨立開發者秀自己做的產品），
@@ -58,7 +58,6 @@ async function translateAndAnnotate(
   hits: HNHit[],
   materials: Material[]
 ): Promise<{ titleZh: string; summary: string; note: string }[]> {
-  const client = getGroqClient()
   const list = hits
     .map((h, i) => {
       const parts = [`${i}. 標題:${h.title}`]
@@ -67,15 +66,7 @@ async function translateAndAnnotate(
       return parts.join('｜')
     })
     .join('\n')
-  const completion = await client.chat.completions.create({
-    model: GROQ_MODEL,
-    // 每則多了 60–100 字摘要，24 則的中文輸出遠超原本 2500 的額度，不夠會被截斷成殘缺 JSON
-    max_tokens: 8000,
-    response_format: { type: 'json_object' },
-    messages: [
-      {
-        role: 'system',
-        content: `你幫台灣的獨立開發者/創業者整理 Hacker News 上的 Show HN 產品清單，激發創業靈感。
+  const system = `你幫台灣的獨立開發者/創業者整理 Hacker News 上的 Show HN 產品清單，激發創業靈感。
 
 對輸入的每一項，輸出：
 - titleZh：一句話講這個東西是什麼，15–25 字，像產品的中文小標。簡潔就好，細節留給 summary，不要塞滿功能描述。
@@ -100,14 +91,10 @@ note 嚴禁這幾種寫法（這是最常見的失敗模式）：
 - 只把 titleZh 換個詞重講一遍
 
 只回傳 JSON object，順序要跟輸入完全一致：
-{"items":[{"titleZh":"...","summary":"...","note":"..."}, ...]}`,
-      },
-      { role: 'user', content: list },
-    ],
-  })
-  const raw = completion.choices[0]?.message?.content ?? '{}'
+{"items":[{"titleZh":"...","summary":"...","note":"..."}, ...]}`
   // 加了摘要後輸出長很多，萬一撞到 token 上限會被截成殘缺 JSON。
   // 這時寧可讓整頁降級成英文標題（下游每項都有 ?? 退路），也不要整支 API 掛掉。
+  const raw = await chatJSON(system, list, 8000)
   try {
     const parsed = JSON.parse(raw) as { items?: { titleZh: string; summary: string; note: string }[] }
     return parsed.items ?? []

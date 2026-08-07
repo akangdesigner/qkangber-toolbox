@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getGroqClient, GROQ_MODEL } from '@/lib/groq'
+import { chatJSON } from '@/lib/llm-json'
 import { fetchMetaDescription, cleanStoryText, type HNHit } from '@/lib/hn-fetch'
 
 // 文章靈感：抓 Hacker News 首頁＋Lobsters 熱門的討論文章（不是 Show HN 產品介紹，是有觀點的評論／心得／踩坑文），
@@ -31,6 +31,9 @@ const CACHE_TTL = 30 * 60 * 1000 // 首頁半小時內變化不大，避免每�
 
 const HN_LIMIT = 12
 const LOBSTERS_LIMIT = 12
+// 上游偶爾會吐出舊資料（實測 lobste.rs/hottest.json 曾整批回傳 2020 年的舊聞，
+// 疑似 CDN 快取卡住），這裡直接濾掉太舊的，反正這工具要的就是「還沒被翻過」的新鮮事
+const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
 
 async function fetchFrontPage(): Promise<SourceHit[]> {
   const params = new URLSearchParams()
@@ -91,7 +94,6 @@ async function translateAndJudge(
   hits: SourceHit[],
   materials: Material[]
 ): Promise<{ titleZh: string; summary: string; worth: boolean; worthNote: string }[]> {
-  const client = getGroqClient()
   const list = hits
     .map((h, i) => {
       const parts = [`${i}. 來源:${h.source}｜標題:${h.title}｜分數:${h.points}｜留言數:${h.num_comments}`]
@@ -100,15 +102,7 @@ async function translateAndJudge(
       return parts.join('｜')
     })
     .join('\n')
-  const completion = await client.chat.completions.create({
-    model: GROQ_MODEL,
-    // 24 則（HN 12＋Lobsters 12）中文輸出遠超單一來源的額度，不夠會被截斷成殘缺 JSON
-    max_tokens: 8000,
-    response_format: { type: 'json_object' },
-    messages: [
-      {
-        role: 'system',
-        content: `你幫台灣寫技術部落格（中文讀者、偏開發者/創業者調性）的作者過濾 Hacker News 首頁＋Lobsters 熱門的討論文章。抓的是「國外討論串爆紅 → 翻譯/改寫成中文文章搶流量」這條曝光鏈的時機，所以重點不是產品介紹，是有觀點、有討論度的評論／心得／踩坑文。
+  const system = `你幫台灣寫技術部落格（中文讀者、偏開發者/創業者調性）的作者過濾 Hacker News 首頁＋Lobsters 熱門的討論文章。抓的是「國外討論串爆紅 → 翻譯/改寫成中文文章搶流量」這條曝光鏈的時機，所以重點不是產品介紹，是有觀點、有討論度的評論／心得／踩坑文。
 
 對輸入的每一項，輸出：
 - titleZh：15–25 字中文標題，照原文語氣翻，不要下標題黨
@@ -127,12 +121,9 @@ worth 判斷標準：
 沒有材料（summary 留空）的項目，worthNote 就老實寫「材料不足，先點進去看內文再判斷」，不要硬掰角度。
 
 只回傳 JSON，順序跟輸入完全一致：
-{"items":[{"titleZh":"...","summary":"...","worth":true,"worthNote":"..."}, ...]}`,
-      },
-      { role: 'user', content: list },
-    ],
-  })
-  const raw = completion.choices[0]?.message?.content ?? '{}'
+{"items":[{"titleZh":"...","summary":"...","worth":true,"worthNote":"..."}, ...]}`
+  // 24 則（HN 12＋Lobsters 12）中文輸出遠超單一來源的額度，不夠會被截斷成殘缺 JSON
+  const raw = await chatJSON(system, list, 8000)
   try {
     const parsed = JSON.parse(raw) as {
       items?: { titleZh: string; summary: string; worth: boolean; worthNote: string }[]
@@ -161,7 +152,7 @@ export async function GET() {
         return [] as SourceHit[]
       }),
     ])
-    const hits = [...hnHits, ...lobstersHits]
+    const hits = [...hnHits, ...lobstersHits].filter((h) => Date.now() - new Date(h.created_at).getTime() < MAX_AGE_MS)
     if (hits.length === 0) {
       return NextResponse.json({ success: true, articles: [] })
     }
