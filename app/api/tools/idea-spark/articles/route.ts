@@ -6,7 +6,8 @@ import { fetchMetaDescription, cleanStoryText, type HNHit } from '@/lib/hn-fetch
 // 判斷「值不值得翻譯/改寫成中文部落格文章」＋給切角度建議。
 // 動機：動區動趨這類媒體每天巡 HN 首頁，撈爆紅文章翻譯搶流量，這裡搶的是同一個時機。
 // Lobsters 機制跟 HN 幾乎一樣（投票排序＋公開 JSON），但社群更小眾、還沒被媒體盯上，翻譯時機更早。
-// 首頁熱什麼五花八門，不保證有 AI/vibe coding 討論文，所以額外用關鍵字搜尋 HN 撈 AI 主題的討論串當第三個來源。
+// 首頁熱什麼五花八門，不保證有 AI/vibe coding 討論文，所以額外用關鍵字搜尋 HN、
+// 加上 Lobsters 的 ai/ml tag feed，撈 AI 主題的討論串當第三、四個來源。
 
 type Source = 'Hacker News' | 'Lobsters'
 
@@ -65,9 +66,10 @@ type LobstersHit = {
 // 首頁排序看熱度、不看主題，AI 趨勢文常常擠不進當天首頁；直接用關鍵字搜尋把它們撈出來。
 // 分開查每個關鍵字再合併去重，比丟一串詞給 Algolia 準——Algolia 的 query 是關聯度排序，
 // 混著查會被熱門詞（AI）稀釋掉冷門但精準的詞（vibe coding）。
-const AI_KEYWORDS = ['vibe coding', 'AI agent', 'LLM']
+const AI_KEYWORDS = ['vibe coding', 'AI agent', 'LLM', 'AI coding', 'coding agent']
 const AI_LIMIT_PER_KEYWORD = 5
-const AI_TOTAL_LIMIT = 10
+const AI_TOTAL_LIMIT = 16
+const LOBSTERS_AI_LIMIT = 10
 
 async function fetchAITrending(): Promise<SourceHit[]> {
   const minCreatedAt = Math.floor((Date.now() - MAX_AGE_MS) / 1000)
@@ -116,6 +118,29 @@ async function fetchLobstersHot(): Promise<SourceHit[]> {
     source: 'Lobsters' as const,
     discussionUrl: h.comments_url || h.short_id_url,
   }))
+}
+
+// Lobsters 的 hottest 榜跟 HN 首頁一樣看熱度不看主題，AI 文章常常上不了榜，
+// 這裡直接吃 ai/ml tag 的 feed（依時間排序，非熱度），自己再依分數排序取前幾則。
+async function fetchLobstersAI(): Promise<SourceHit[]> {
+  const res = await fetch('https://lobste.rs/t/ai,ml.json')
+  if (!res.ok) return []
+  const hits = (await res.json()) as LobstersHit[]
+  return hits
+    .filter((h) => Date.now() - new Date(h.created_at).getTime() < MAX_AGE_MS)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, LOBSTERS_AI_LIMIT)
+    .map((h) => ({
+      objectID: h.short_id,
+      title: h.title,
+      url: h.url || h.comments_url,
+      points: h.score,
+      num_comments: h.comment_count,
+      created_at: h.created_at,
+      story_text: h.description_plain || null,
+      source: 'Lobsters' as const,
+      discussionUrl: h.comments_url || h.short_id_url,
+    }))
 }
 
 // 每則的說明素材。沒素材的判斷只能靠標題猜，AI 會老實說材料不足。
@@ -182,8 +207,8 @@ export async function GET() {
   }
 
   try {
-    // 三個來源互不依賴：一個掛了不該賠掉另外兩個
-    const [hnHits, lobstersHits, aiHits] = await Promise.all([
+    // 四個來源互不依賴：一個掛了不該賠掉其他幾個
+    const [hnHits, lobstersHits, aiHits, lobstersAiHits] = await Promise.all([
       fetchFrontPage().catch((err) => {
         console.error('[idea-spark/articles] Hacker News 抓取失敗', err)
         return [] as SourceHit[]
@@ -193,14 +218,20 @@ export async function GET() {
         return [] as SourceHit[]
       }),
       fetchAITrending().catch((err) => {
-        console.error('[idea-spark/articles] AI 主題搜尋失敗', err)
+        console.error('[idea-spark/articles] HN AI 主題搜尋失敗', err)
+        return [] as SourceHit[]
+      }),
+      fetchLobstersAI().catch((err) => {
+        console.error('[idea-spark/articles] Lobsters AI tag 抓取失敗', err)
         return [] as SourceHit[]
       }),
     ])
-    // AI 關鍵字搜尋可能撈到跟首頁重複的貼文，用 objectID 去重
-    const seenIds = new Set(hnHits.map((h) => h.objectID))
-    const dedupedAiHits = aiHits.filter((h) => !seenIds.has(h.objectID))
-    const hits = [...hnHits, ...dedupedAiHits, ...lobstersHits].filter(
+    // AI 主題搜尋可能撈到跟首頁/熱門榜重複的貼文，用 objectID 去重
+    const seenHnIds = new Set(hnHits.map((h) => h.objectID))
+    const dedupedAiHits = aiHits.filter((h) => !seenHnIds.has(h.objectID))
+    const seenLobstersIds = new Set(lobstersHits.map((h) => h.objectID))
+    const dedupedLobstersAiHits = lobstersAiHits.filter((h) => !seenLobstersIds.has(h.objectID))
+    const hits = [...hnHits, ...dedupedAiHits, ...dedupedLobstersAiHits, ...lobstersHits].filter(
       (h) => Date.now() - new Date(h.created_at).getTime() < MAX_AGE_MS
     )
     if (hits.length === 0) {
