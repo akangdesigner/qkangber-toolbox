@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import type { Candidate, FetchReport } from '@/lib/news-fetch'
+import type { Candidate } from '@/lib/news-fetch'
 import type { PostedLog } from '@/lib/news'
 
 const typeColor: Record<string, string> = {
@@ -36,7 +36,6 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [saving, setSaving] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
-  const [report, setReport] = useState<FetchReport | null>(null)
   const [lang, setLang] = useState<'all' | 'zh' | 'en'>('all')
   const [onlyRewrite, setOnlyRewrite] = useState(false)
   const [posted, setPosted] = useState<PostedLog[]>(history)
@@ -54,7 +53,6 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
       if (res.ok && json.ok) {
         const items: Candidate[] = json.items || []
         setCandidates(items)
-        setReport(json.report ?? null)
         setDrafts(Object.fromEntries(items.map((c) => [c.原文連結, emptyDrafts()])))
         setTab(Object.fromEntries(items.map((c) => [c.原文連結, '感性' as VKey])))
         setWithImg(Object.fromEntries(items.map((c) => [c.原文連結, c.配圖 === '是' && !!c.圖片連結])))
@@ -373,27 +371,6 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
           </button>
         )}
       </div>
-
-      {report && (
-        <div className="rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3 text-xs text-slate-400 space-y-2">
-          <p>
-            抓到 {report.抓到} 則 → 標題去重剩 {report.去重後} → 送 AI 評分 {report.送打分} → 留下{' '}
-            <span className="text-slate-200">{candidates.length}</span> 則
-            {report.低分 > 0 && `（${report.低分} 則分數不夠`}
-            {report.低分 > 0 && report.名額外 > 0 && '，'}
-            {report.低分 === 0 && report.名額外 > 0 && '（'}
-            {report.名額外 > 0 && `${report.名額外} 則夠分但排不進名額`}
-            {(report.低分 > 0 || report.名額外 > 0) && '）'}
-          </p>
-          <p className="flex flex-wrap gap-x-3 gap-y-1">
-            {report.來源.map((s) => (
-              <span key={s.名稱} className={s.狀態 === 'ok' ? 'text-slate-500' : 'text-amber-400'}>
-                {s.名稱} {s.狀態 === 'ok' ? `${s.收下} 則` : s.狀態}
-              </span>
-            ))}
-          </p>
-        </div>
-      )}
 
       {candidates.length === 0 && (
         <p className="text-sm text-slate-500">按「抓最新新聞」開始。候選只留在這頁，重新整理就會清掉；發出去的會記在下方。</p>
