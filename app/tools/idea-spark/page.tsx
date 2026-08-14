@@ -15,20 +15,6 @@ type Idea = {
   createdAt: string
 }
 
-type Article = {
-  source: 'Hacker News' | 'Lobsters'
-  title: string
-  titleZh: string
-  summary: string
-  worth: boolean
-  worthNote: string
-  url: string
-  discussionUrl: string
-  points: number
-  comments: number
-  createdAt: string
-}
-
 type RadarIdea = {
   row: number
   日期: string
@@ -306,97 +292,8 @@ function ShowHNTab() {
   )
 }
 
-function ArticleTab() {
-  const [articles, setArticles] = useState<Article[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    ;(async () => {
-      try {
-        const res = await fetch('/api/tools/idea-spark/articles')
-        const json = await res.json()
-        if (!res.ok) throw new Error(json.error ?? '抓取失敗')
-        setArticles(json.articles ?? [])
-      } catch (err) {
-        setError(err instanceof Error ? err.message : '發生錯誤')
-      } finally {
-        setLoading(false)
-      }
-    })()
-  }, [])
-
-  return (
-    <div>
-      <p className="text-slate-400 mb-6">
-        抓 Hacker News 首頁＋Lobsters 熱門的討論文章（不是 Show HN 產品，是有觀點的評論/心得文）。動區動趨這類媒體每天在這裡撈爆紅文章搶先翻譯，AI 幫你判斷值不值得跟進寫、切什麼角度。
-      </p>
-
-      {error && (
-        <div className="mb-6 rounded-xl px-4 py-3 text-sm text-red-400" style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.15)' }}>
-          {error}
-        </div>
-      )}
-
-      {loading && <p className="text-center text-sm text-slate-600 mt-10">抓取中…</p>}
-
-      <div className="space-y-4">
-        {articles.map((article) => (
-          <div
-            key={article.discussionUrl}
-            className="rounded-2xl px-5 py-4"
-            style={{
-              background: article.worth ? 'rgba(139,92,246,0.05)' : 'rgba(255,255,255,0.02)',
-              border: article.worth ? '1px solid rgba(139,92,246,0.25)' : '1px solid rgba(255,255,255,0.06)',
-              opacity: article.worth ? 1 : 0.7,
-            }}
-          >
-            <div className="flex items-center gap-2 mb-2">
-              {article.worth && (
-                <span
-                  className="px-2 py-0.5 rounded-full text-xs font-medium"
-                  style={{ background: 'rgba(251,191,36,0.15)', color: '#fbbf24' }}
-                >
-                  ⭐ 值得寫
-                </span>
-              )}
-              <span
-                className="px-2 py-0.5 rounded-full text-xs"
-                style={{
-                  background: article.source === 'Lobsters' ? 'rgba(249,115,22,0.12)' : 'rgba(99,102,241,0.12)',
-                  color: article.source === 'Lobsters' ? '#fb923c' : '#a5b4fc',
-                }}
-              >
-                {article.source === 'Lobsters' ? '🦞 Lobsters' : '🟠 Hacker News'}
-              </span>
-            </div>
-            <h2 className="text-white font-medium mb-1">{article.titleZh}</h2>
-            <p className="text-xs text-slate-500 mb-2">{article.title}</p>
-            {article.summary && <p className="text-sm text-slate-300 leading-relaxed mb-3">{article.summary}</p>}
-            {article.worthNote && <p className="text-sm text-violet-300 mb-3">✍️ {article.worthNote}</p>}
-            <div className="flex items-center gap-4 text-xs text-slate-500">
-              <span>▲ {article.points}</span>
-              <span>💬 {article.comments}</span>
-              <a href={article.url} target="_blank" rel="noopener noreferrer" className="underline decoration-dotted hover:text-slate-300">
-                看原文
-              </a>
-              <a href={article.discussionUrl} target="_blank" rel="noopener noreferrer" className="underline decoration-dotted hover:text-slate-300">
-                看討論
-              </a>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {!loading && articles.length === 0 && !error && (
-        <p className="text-center text-sm text-slate-600 mt-10">現在首頁沒抓到東西，晚點再來看</p>
-      )}
-    </div>
-  )
-}
-
 export default function IdeaSparkPage() {
-  const [tab, setTab] = useState<'radar' | 'hn' | 'articles'>('radar')
+  const [tab, setTab] = useState<'radar' | 'hn'>('radar')
 
   return (
     <main className="relative max-w-2xl mx-auto px-4 sm:px-6 py-12">
@@ -420,16 +317,9 @@ export default function IdeaSparkPage() {
         >
           🌏 Show HN 靈感
         </button>
-        <button
-          onClick={() => setTab('articles')}
-          className="px-5 py-2 rounded-full text-sm text-white transition-all"
-          style={chipStyle(tab === 'articles')}
-        >
-          📝 文章靈感
-        </button>
       </div>
 
-      {tab === 'radar' ? <RadarTab /> : tab === 'hn' ? <ShowHNTab /> : <ArticleTab />}
+      {tab === 'radar' ? <RadarTab /> : <ShowHNTab />}
     </main>
   )
 }

@@ -38,10 +38,13 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [fetching, setFetching] = useState(false)
   const [report, setReport] = useState<FetchReport | null>(null)
   const [lang, setLang] = useState<'all' | 'zh' | 'en'>('all')
+  const [onlyRewrite, setOnlyRewrite] = useState(false)
   const [posted, setPosted] = useState<PostedLog[]>(history)
 
-  const zh = candidates.filter((c) => hasCJK(c.標題))
-  const en = candidates.filter((c) => !hasCJK(c.標題))
+  const rewriteFiltered = onlyRewrite ? candidates.filter((c) => c.適合改寫) : candidates
+  const zh = rewriteFiltered.filter((c) => hasCJK(c.標題))
+  const en = rewriteFiltered.filter((c) => !hasCJK(c.標題))
+  const rewriteCount = candidates.filter((c) => c.適合改寫).length
 
   async function runFetch() {
     setFetching(true)
@@ -208,11 +211,17 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
                 {c.類型 || '未分類'}
               </span>
               <span className="text-slate-500">分數 {c.分數}</span>
+              {c.適合改寫 && (
+                <span className="px-2 py-0.5 rounded-full border bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30">
+                  ✍️ 適合改寫
+                </span>
+              )}
               <span className="text-slate-500">{c.來源}</span>
               {c.時間 && <span className="ml-auto text-slate-500">🕒 {c.時間}</span>}
             </div>
             <h3 className="text-lg font-semibold text-white leading-snug mb-2">{c.標題}</h3>
             {c.摘要 && <p className="text-sm text-slate-400 leading-relaxed mb-3">{c.摘要}</p>}
+            {c.適合改寫 && c.改寫建議 && <p className="text-sm text-violet-300 mb-3">✍️ {c.改寫建議}</p>}
             {c.圖片連結 && (
               <div className="mb-3">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -337,7 +346,7 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
         {candidates.length > 0 && (
           <div className="flex gap-1.5">
             {([
-              ['all', `全部 ${candidates.length}`],
+              ['all', `全部 ${rewriteFiltered.length}`],
               ['zh', `🇹🇼 中文 ${zh.length}`],
               ['en', `🌐 英文 ${en.length}`],
             ] as const).map(([k, label]) => (
@@ -352,6 +361,16 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
               </button>
             ))}
           </div>
+        )}
+        {rewriteCount > 0 && (
+          <button
+            onClick={() => setOnlyRewrite((v) => !v)}
+            className={`px-3 py-1 rounded-full text-xs border transition-colors ${
+              onlyRewrite ? 'bg-fuchsia-600 border-fuchsia-500 text-white' : 'bg-white/5 border-white/10 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            ✍️ 只看適合改寫（{rewriteCount}）
+          </button>
         )}
       </div>
 

@@ -3,6 +3,7 @@
 // 別直接呼叫 getGroqClient——那會繞過這個切換，把請求全打在 Groq 的免費額度上（實測整輪 429）。
 import { chatJSON } from '@/lib/llm-json'
 import { getPostedLog, twTime } from '@/lib/news'
+import { cleanStoryText } from '@/lib/hn-fetch'
 
 // minScore／maxAgeDays 是「這個來源用不同的尺」：
 // 政府補助公告不該用「分享價值」評分，時效也不是兩天（看的是申請截止日，不是發布日）。
@@ -19,6 +20,8 @@ export type Candidate = {
   圖片連結: string
   配圖: string
   摘要: string
+  適合改寫: boolean // 值不值得另外寫成部落格長文（原「文章靈感」分頁的判斷，併進來跟分享價值一起評）
+  改寫建議: string // 適合改寫為 true 時的切角度建議；false 時是空字串
   // 三種風格的草稿不在這裡生。使用者在前端點了風格才呼叫 /api/news/draft，
   // 避免幫沒人要看的新聞先寫三篇（一篇約 1.6k token）。
 }
@@ -150,9 +153,9 @@ const SCORE_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐�
 回傳 JSON：{"結果":[{"編號":1,"分數":8}]}
 每一則都要回，編號要跟我給的一致，不可省略或合併。不要寫任何理由。只回 JSON。`
 
-// 第二階段只寫摘要，不寫貼文草稿。草稿改成前端點了才呼叫 /api/news/draft，
-// 所以這裡從 1800 token 縮到 500，同樣的預算可以多看兩倍的新聞。
-const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一則科技新聞，請判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值，並寫一段摘要。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要。
+// 第二階段寫摘要＋判斷適不適合改寫成文章（原「文章靈感」分頁的 worth 判斷併過來，同一則新聞不用問兩次 AI）。
+// 草稿改成前端點了才呼叫 /api/news/draft，這裡的預算才擠得出「改寫建議」這個新欄位。
+const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編，同時也幫他過濾哪些新聞值得另外寫成中文部落格長文。我會給你一則科技新聞，請做兩件事：判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值並寫摘要；再判斷它適不適合改寫成長文。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要、適合改寫、改寫建議。
 
 分數是 0 到 10 的整數，代表這則新聞的分享價值：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。
 特例：分類是「政府一手」時這是公告不是新聞，有明確申請對象、補助金額或截止日的給 7 分以上；純徵才、內部行政、得獎名單給 2 分。
@@ -160,6 +163,10 @@ const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐
 摘要：用繁體中文 200 到 300 字說明這則新聞，先講發生了什麼事、再補重點細節與背景、最後帶為什麼值得關注，分 2 到 3 段寫清楚來龍去脈，讓人不點原文也能完整看懂（英文新聞也要翻成中文摘要）。
 分類是「政府一手」時，摘要要寫清楚「誰可以申請、什麼時候截止、給多少」，這比背景重要。
 不可以只把標題換句話說；我給的原始摘要很短甚至空白時，就用你對這個領域的常識補背景，但不可以編造數字、日期或引述。
+
+適合改寫：布林值。純技術新聞（新版本發布、公司併購、募資新聞、公告）沒有觀點好切，給 false；有明確論點、方法論、或作者踩坑心得，能延伸出台灣場景對比、反方論點、實戰案例這類討論空間的，才給 true。分類是「政府一手」時一律 false。
+
+改寫建議：一句完整的話（25 到 45 字）。適合改寫是 true 時，具體指名可以切的角度（哪個台灣場景對比、延伸哪個反方論點、補一個原文沒講的案例），不能寫「可以結合在地案例探討」這種誰套都成立的空話；適合改寫是 false 時給空字串。
 
 只回 JSON。`
 
@@ -213,6 +220,94 @@ async function fetchHackerNews(): Promise<Parsed[]> {
         摘要: '',
         圖片連結: '',
         發布時間: h.created_at || '',
+      }))
+  } catch {
+    return []
+  }
+}
+
+// 原「文章靈感」分頁的兩個來源併過來：首頁排序看熱度不看主題，AI 趨勢文常常擠不進 fetchHackerNews 的前 6 則，
+// 這裡直接用關鍵字搜尋、分開查每個關鍵字再合併去重（混著查會被熱門詞「AI」稀釋掉冷門但精準的詞「vibe coding」）。
+const AI_KEYWORDS = ['vibe coding', 'AI agent', 'LLM', 'AI coding', 'coding agent']
+const AI_LIMIT_PER_KEYWORD = 5
+const AI_TOTAL_LIMIT = 16
+const AI_MAX_AGE_DAYS = 14 // 這是討論熱度不是發布時間，用一般新聞的 2 天窗口會直接濾光
+
+async function fetchAITrending(): Promise<Parsed[]> {
+  const minCreatedAt = Math.floor((Date.now() - AI_MAX_AGE_DAYS * 24 * 3600 * 1000) / 1000)
+  const results = await Promise.all(
+    AI_KEYWORDS.map(async (keyword) => {
+      const params = new URLSearchParams()
+      params.set('query', keyword)
+      params.set('tags', 'story')
+      params.set('hitsPerPage', String(AI_LIMIT_PER_KEYWORD))
+      params.set('numericFilters', `created_at_i>${minCreatedAt},points>=10`)
+      try {
+        const res = await fetch(`https://hn.algolia.com/api/v1/search?${params.toString()}`, {
+          cache: 'no-store',
+          headers: { 'User-Agent': UA },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        })
+        if (!res.ok) return [] as Array<{ objectID: string; title?: string; url?: string | null; created_at?: string; story_text?: string | null }>
+        const json = await res.json()
+        return (json.hits ?? []) as Array<{ objectID: string; title?: string; url?: string | null; created_at?: string; story_text?: string | null }>
+      } catch {
+        return []
+      }
+    })
+  )
+  const seen = new Set<string>()
+  const out: Parsed[] = []
+  for (const hits of results) {
+    for (const h of hits) {
+      if (!h.title || seen.has(h.objectID)) continue
+      seen.add(h.objectID)
+      out.push({
+        標題: h.title,
+        原文連結: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+        來源: 'HN AI關鍵字',
+        類型: 'AI/LLM',
+        摘要: cleanStoryText(h.story_text),
+        圖片連結: '',
+        發布時間: h.created_at || '',
+      })
+    }
+  }
+  return out.slice(0, AI_TOTAL_LIMIT)
+}
+
+const LOBSTERS_AI_LIMIT = 10
+
+// Lobsters hottest 榜跟 HN 首頁一樣看熱度不看主題，AI 文章常常上不了榜，直接吃 ai/ml tag 的 feed。
+async function fetchLobstersAI(): Promise<Parsed[]> {
+  try {
+    const res = await fetch('https://lobste.rs/t/ai,ml.json', {
+      cache: 'no-store',
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (!res.ok) return []
+    const hits = (await res.json()) as Array<{
+      short_id: string
+      title: string
+      url?: string
+      score: number
+      created_at: string
+      description_plain?: string
+      comments_url: string
+    }>
+    return hits
+      .filter((h) => Date.now() - new Date(h.created_at).getTime() < AI_MAX_AGE_DAYS * 24 * 3600 * 1000)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, LOBSTERS_AI_LIMIT)
+      .map((h) => ({
+        標題: h.title,
+        原文連結: h.url || h.comments_url,
+        來源: 'Lobsters AI tag',
+        類型: 'AI/LLM',
+        摘要: strip(h.description_plain || '').slice(0, 600),
+        圖片連結: '',
+        發布時間: h.created_at,
       }))
   } catch {
     return []
@@ -409,7 +504,7 @@ function dedupeByTitle(items: Parsed[]): Parsed[] {
   return kept
 }
 
-type Summary = { 分數: number; 摘要: string }
+type Summary = { 分數: number; 摘要: string; 適合改寫: boolean; 改寫建議: string }
 
 // 撞到 token 上限要讓前端講清楚，不能跟「今天沒新聞」長得一樣。
 // 訊息不要寫死是哪一家：實際打的是 OpenRouter 還是 Groq，要看 OPENROUTER_API_KEY 有沒有設。
@@ -459,12 +554,17 @@ async function summarize(n: Parsed): Promise<Summary | null> {
   const raw = await chatJSON(
     SUMMARY_PROMPT,
     `標題:${n.標題}\n來源:${n.來源}\n分類:${n.類型}\n摘要:${n.摘要}\n原文連結:${n.原文連結}`,
-    500,
+    650,
     0.5
   )
   try {
-    const r = JSON.parse(raw) as { 分數?: number; 摘要?: string }
-    return { 分數: Number(r.分數 ?? 0), 摘要: String(r.摘要 ?? '') }
+    const r = JSON.parse(raw) as { 分數?: number; 摘要?: string; 適合改寫?: boolean; 改寫建議?: string }
+    return {
+      分數: Number(r.分數 ?? 0),
+      摘要: String(r.摘要 ?? ''),
+      適合改寫: Boolean(r.適合改寫),
+      改寫建議: String(r.改寫建議 ?? ''),
+    }
   } catch {
     return null
   }
@@ -508,8 +608,10 @@ export async function fetchNewsCandidates(): Promise<{
 
   // 33 條來源一定要並行抓。原本是 for 迴圈一條一條 await，單條 timeout 15 秒，
   // 最壞情況會累積到八分鐘——前端會等到像當掉（這裡沒有 maxDuration 幫忙砍，見 route 的註解）。
-  const [hn, feeds, scraped] = await Promise.all([
+  const [hn, aiHN, lobstersAI, feeds, scraped] = await Promise.all([
     fetchHackerNews(),
+    fetchAITrending(),
+    fetchLobstersAI(),
     Promise.all(
       FEEDS.map(async (feed) => {
         try {
@@ -556,6 +658,8 @@ export async function fetchNewsCandidates(): Promise<{
     return n
   }
   來源.push({ 名稱: 'Hacker News', 收下: take(hn), 狀態: hn.length ? 'ok' : '抓不到' })
+  來源.push({ 名稱: 'HN AI關鍵字', 收下: take(aiHN, AI_MAX_AGE_DAYS), 狀態: aiHN.length ? 'ok' : '抓不到' })
+  來源.push({ 名稱: 'Lobsters AI tag', 收下: take(lobstersAI, AI_MAX_AGE_DAYS), 狀態: lobstersAI.length ? 'ok' : '抓不到' })
   for (const f of [...feeds, ...scraped])
     來源.push({ 名稱: f.feed.name, 收下: take(f.items, f.feed.maxAgeDays), 狀態: f.狀態 })
 
@@ -657,6 +761,8 @@ export async function fetchNewsCandidates(): Promise<{
       圖片連結: n.圖片連結,
       配圖: n.圖片連結 ? '是' : '否',
       摘要: r.摘要,
+      適合改寫: r.適合改寫,
+      改寫建議: r.改寫建議,
     })
   })
   return {
