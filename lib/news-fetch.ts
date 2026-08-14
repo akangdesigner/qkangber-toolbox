@@ -57,7 +57,8 @@ const FEEDS: Feed[] = [
   { name: 'The Verge', track: '國際科技', url: 'https://www.theverge.com/rss/index.xml' },
   { name: 'Ars Technica', track: '國際科技', url: 'https://feeds.arstechnica.com/arstechnica/index' },
   { name: 'Apple Newsroom', track: '國際科技', url: 'https://www.apple.com/newsroom/rss-feed.rss', maxAgeDays: 7 },
-  { name: 'Lobsters', track: '國際科技', url: 'https://lobste.rs/rss' },
+  // Lobsters 熱門文章改走 fetchLobstersHot（分數排序、14 天視窗，原「文章靈感」分頁的抓法），
+  // 不要在這裡疊一條 lobste.rs/rss（時間排序、2 天視窗）——同一個站兩種抓法會重複打、還互搶名額。
   // —— 工程／開發一手：平台自己公告的變更。對接案的人來說「工具變了」比新聞更有用 ——
   { name: 'n8n 官方', track: '工程/開發', url: 'https://blog.n8n.io/rss/', maxAgeDays: 7 },
   { name: 'GitHub Blog', track: '工程/開發', url: 'https://github.blog/feed/', maxAgeDays: 7 },
@@ -277,6 +278,44 @@ async function fetchAITrending(): Promise<Parsed[]> {
 }
 
 const LOBSTERS_AI_LIMIT = 10
+const LOBSTERS_HOT_LIMIT = 12
+
+// 原「文章靈感」分頁的第三個來源：hottest 榜是分數排序，跟 lobste.rs/rss 的時間排序不同，
+// 撈的是「還在被討論」的文章，不是「剛發的」；視窗跟著 AI tag 一樣放寬到 14 天。
+async function fetchLobstersHot(): Promise<Parsed[]> {
+  try {
+    const res = await fetch('https://lobste.rs/hottest.json', {
+      cache: 'no-store',
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (!res.ok) return []
+    const hits = (await res.json()) as Array<{
+      short_id: string
+      title: string
+      url?: string
+      score: number
+      created_at: string
+      description_plain?: string
+      comments_url: string
+    }>
+    return hits
+      .filter((h) => Date.now() - new Date(h.created_at).getTime() < AI_MAX_AGE_DAYS * 24 * 3600 * 1000)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, LOBSTERS_HOT_LIMIT)
+      .map((h) => ({
+        標題: h.title,
+        原文連結: h.url || h.comments_url,
+        來源: 'Lobsters',
+        類型: '國際科技',
+        摘要: strip(h.description_plain || '').slice(0, 600),
+        圖片連結: '',
+        發布時間: h.created_at,
+      }))
+  } catch {
+    return []
+  }
+}
 
 // Lobsters hottest 榜跟 HN 首頁一樣看熱度不看主題，AI 文章常常上不了榜，直接吃 ai/ml tag 的 feed。
 async function fetchLobstersAI(): Promise<Parsed[]> {
@@ -608,10 +647,11 @@ export async function fetchNewsCandidates(): Promise<{
 
   // 33 條來源一定要並行抓。原本是 for 迴圈一條一條 await，單條 timeout 15 秒，
   // 最壞情況會累積到八分鐘——前端會等到像當掉（這裡沒有 maxDuration 幫忙砍，見 route 的註解）。
-  const [hn, aiHN, lobstersAI, feeds, scraped] = await Promise.all([
+  const [hn, aiHN, lobstersAI, lobstersHot, feeds, scraped] = await Promise.all([
     fetchHackerNews(),
     fetchAITrending(),
     fetchLobstersAI(),
+    fetchLobstersHot(),
     Promise.all(
       FEEDS.map(async (feed) => {
         try {
@@ -660,6 +700,7 @@ export async function fetchNewsCandidates(): Promise<{
   來源.push({ 名稱: 'Hacker News', 收下: take(hn), 狀態: hn.length ? 'ok' : '抓不到' })
   來源.push({ 名稱: 'HN AI關鍵字', 收下: take(aiHN, AI_MAX_AGE_DAYS), 狀態: aiHN.length ? 'ok' : '抓不到' })
   來源.push({ 名稱: 'Lobsters AI tag', 收下: take(lobstersAI, AI_MAX_AGE_DAYS), 狀態: lobstersAI.length ? 'ok' : '抓不到' })
+  來源.push({ 名稱: 'Lobsters', 收下: take(lobstersHot, AI_MAX_AGE_DAYS), 狀態: lobstersHot.length ? 'ok' : '抓不到' })
   for (const f of [...feeds, ...scraped])
     來源.push({ 名稱: f.feed.name, 收下: take(f.items, f.feed.maxAgeDays), 狀態: f.狀態 })
 
