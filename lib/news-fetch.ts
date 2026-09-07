@@ -26,7 +26,11 @@ export type Candidate = {
   // 避免幫沒人要看的新聞先寫三篇（一篇約 1.6k token）。
 }
 
-const MAX_AGE_DAYS = 2 // 預設：超過兩天的新聞不收（單一來源可用 maxAgeDays 覆寫）
+const MAX_AGE_DAYS = 2 // 預設：超過兩天的新聞不收（單一來源可用 maxAgeDays 放寬）
+// 天花板：不管來源自己寫幾天，超過七天的一律不收。
+// 沒有這條的話，政府公告那種 14 天窗口會在畫面上放進上個月的則數，看起來像抓錯。
+// 新增來源時也不必再一條一條檢查——isFresh 會把任何超過這個值的窗口夾回來。
+const HARD_MAX_AGE_DAYS = 7
 
 // 只收第一手：發布者自己講的，或記者自己採訪的。
 // 不收純翻譯層（INSIDE／科技報橘／TechNews／Google News 聚合）——他們的稿子出處欄寫的就是下面這幾家
@@ -71,9 +75,9 @@ const FEEDS: Feed[] = [
   { name: '中央社科技', track: '台灣科技', url: 'https://feeds.feedburner.com/rsscna/technology', maxAgeDays: 3 },
   { name: 'iThome', track: '台灣科技', url: 'https://www.ithome.com.tw/rss' }, // 自家記者採訪台灣企業 IT／資安，不是編譯外電
   // 政府一手：更新以月計，兩天窗口會全部濾光；評分改用「有沒有可申請的東西」那把尺
-  { name: '國科會公告', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/news', minScore: 5, maxAgeDays: 14 },
-  { name: '國科會新聞', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/newsdata', minScore: 5, maxAgeDays: 14 },
-  { name: '產業發展署', track: '政府一手', url: 'https://www.ida.gov.tw/ctlr?PRO=rss.RSSView&t=1', minScore: 5, maxAgeDays: 14 },
+  { name: '國科會公告', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/news', minScore: 5, maxAgeDays: 7 },
+  { name: '國科會新聞', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/newsdata', minScore: 5, maxAgeDays: 7 },
+  { name: '產業發展署', track: '政府一手', url: 'https://www.ida.gov.tw/ctlr?PRO=rss.RSSView&t=1', minScore: 5, maxAgeDays: 7 },
   // 沒接美通社（PR Newswire Asia）：確實是「企業自己發稿」的一手，
   // 但 1-1／1-2／1-3 三個頻道實測全是簡體的中國企業公關稿，對台灣讀者是錯的那種一手。
   // 沒接 arXiv：近 7 天 261 則，但那是論文摘要不是可轉發的新聞，接了只會把名額洗掉。
@@ -232,7 +236,7 @@ async function fetchHackerNews(): Promise<Parsed[]> {
 const AI_KEYWORDS = ['vibe coding', 'AI agent', 'LLM', 'AI coding', 'coding agent']
 const AI_LIMIT_PER_KEYWORD = 5
 const AI_TOTAL_LIMIT = 16
-const AI_MAX_AGE_DAYS = 14 // 這是討論熱度不是發布時間，用一般新聞的 2 天窗口會直接濾光
+const AI_MAX_AGE_DAYS = HARD_MAX_AGE_DAYS // 這是討論熱度不是發布時間，用一般新聞的 2 天窗口會直接濾光，但也不放寬到天花板以外
 
 async function fetchAITrending(): Promise<Parsed[]> {
   const minCreatedAt = Math.floor((Date.now() - AI_MAX_AGE_DAYS * 24 * 3600 * 1000) / 1000)
@@ -464,7 +468,7 @@ const SCRAPERS: Scraper[] = [
     track: '政府一手',
     url: 'https://moda.gov.tw/press/press-releases/372.html',
     minScore: 5,
-    maxAgeDays: 14,
+    maxAgeDays: 7,
     parse: parseModa,
   },
   // 沒接教育部青年發展署：實測兩輪都是收下 4 則、過稿 0 則。
@@ -609,12 +613,15 @@ async function summarize(n: Parsed): Promise<Summary | null> {
   }
 }
 
-// 預設兩天內才收；政府公告那類用來源自己的窗口（沒日期的當作新的留著）
+// 預設兩天內才收；政府公告那類用來源自己的窗口，但一律夾在 HARD_MAX_AGE_DAYS 以內。
+// 日期讀不出來的就不收：以前是「當作新的留著」，結果變成沒日期＝不受任何時效限制的後門。
+// 某條來源因此整條掛零時，抓取報告的「收下」欄會是 0，比默默混進舊聞好查。
 function isFresh(發布時間: string, maxAgeDays?: number): boolean {
-  if (!發布時間) return true
+  if (!發布時間) return false
   const t = Date.parse(發布時間)
-  if (isNaN(t)) return true
-  return Date.now() - t <= (maxAgeDays ?? MAX_AGE_DAYS) * 24 * 3600 * 1000
+  if (isNaN(t)) return false
+  const days = Math.min(maxAgeDays ?? MAX_AGE_DAYS, HARD_MAX_AGE_DAYS)
+  return Date.now() - t <= days * 24 * 3600 * 1000
 }
 
 // 每個階段剩幾則，讓前端能講清楚「為什麼只有這幾則」。
