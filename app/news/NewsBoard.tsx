@@ -6,6 +6,7 @@ import type { PostedLog } from '@/lib/news'
 
 const typeColor: Record<string, string> = {
   'AI/LLM': 'bg-violet-500/15 text-violet-300 border-violet-500/30',
+  'AI 趨勢觀點': 'bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30',
   台灣科技: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
   '工程/開發': 'bg-sky-500/15 text-sky-300 border-sky-500/30',
   國際科技: 'bg-amber-500/15 text-amber-300 border-amber-500/30',

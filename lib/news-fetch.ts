@@ -1,7 +1,7 @@
 // 抓最新科技新聞 → AI 改寫成 3 種 Threads 草稿 → 回傳候選（不寫表，留前端）
 // 走 lib/llm-json 的共用入口：有 OPENROUTER_API_KEY 就用 OpenRouter，沒有才退回 Groq。
 // 別直接呼叫 getGroqClient——那會繞過這個切換，把請求全打在 Groq 的免費額度上（實測整輪 429）。
-import { chatJSON } from '@/lib/llm-json'
+import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
 import { getPostedLog, twTime } from '@/lib/news'
 import { cleanStoryText } from '@/lib/hn-fetch'
 
@@ -56,6 +56,34 @@ const FEEDS: Feed[] = [
   // —— 社群一手：新模型常常先在這裡被人跑過，才輪到媒體寫 ——
   { name: 'r/LocalLLaMA', track: 'AI/LLM', url: 'https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day' },
   { name: 'Simon Willison', track: 'AI/LLM', url: 'https://simonwillison.net/atom/everything/' },
+  // —— AI 趨勢觀點：有論點的人寫的長文，不是「誰又出了什麼功能」——
+  // 官方 blog＋工程平台的公告本質上都是產品介紹，畫面上疊起來就是一排單一工具的新功能；
+  // 這一組補的是「這些東西合起來代表什麼」：產業分析、方法論、反方意見。
+  // 都是週更甚至月更的長文，兩天窗口會長期掛零，一律 7 天。
+  // 打分時看的是論點有沒有新意（見 SCORE_PROMPT），名額另外保底（見 TRACK_QUOTA），
+  // 不然它們的「分享價值」會被 OpenAI 發新模型那種硬新聞壓下去。
+  { name: 'Stratechery', track: 'AI 趨勢觀點', url: 'https://stratechery.com/feed/', maxAgeDays: 7 },
+  { name: 'Import AI', track: 'AI 趨勢觀點', url: 'https://importai.substack.com/feed', maxAgeDays: 7 },
+  { name: 'One Useful Thing', track: 'AI 趨勢觀點', url: 'https://www.oneusefulthing.org/feed', maxAgeDays: 7 },
+  { name: 'Interconnects', track: 'AI 趨勢觀點', url: 'https://www.interconnects.ai/feed', maxAgeDays: 7 },
+  { name: 'Ahead of AI', track: 'AI 趨勢觀點', url: 'https://magazine.sebastianraschka.com/feed', maxAgeDays: 7 },
+  { name: 'Understanding AI', track: 'AI 趨勢觀點', url: 'https://www.understandingai.org/feed', maxAgeDays: 7 },
+  { name: 'Exponential View', track: 'AI 趨勢觀點', url: 'https://www.exponentialview.co/feed', maxAgeDays: 7 },
+  { name: 'Benedict Evans', track: 'AI 趨勢觀點', url: 'https://www.ben-evans.com/benedictevans?format=rss', maxAgeDays: 7 },
+  { name: 'SemiAnalysis', track: 'AI 趨勢觀點', url: 'https://newsletter.semianalysis.com/feed', maxAgeDays: 7 },
+  { name: 'Pragmatic Engineer', track: 'AI 趨勢觀點', url: 'https://newsletter.pragmaticengineer.com/feed', maxAgeDays: 7 },
+  { name: 'Latent Space', track: 'AI 趨勢觀點', url: 'https://www.latent.space/feed', maxAgeDays: 7 },
+  { name: 'Platformer', track: 'AI 趨勢觀點', url: 'https://www.platformer.news/rss/', maxAgeDays: 7 },
+  { name: 'MIT Tech Review AI', track: 'AI 趨勢觀點', url: 'https://www.technologyreview.com/topic/artificial-intelligence/feed', maxAgeDays: 7 },
+  { name: 'Sam Altman', track: 'AI 趨勢觀點', url: 'https://blog.samaltman.com/posts.atom', maxAgeDays: 7 },
+  // 反方：整組都是看多 AI 的人，沒有唱衰的聲音就寫不出「觸發討論」那種草稿
+  { name: 'Gary Marcus', track: 'AI 趨勢觀點', url: 'https://garymarcus.substack.com/feed', maxAgeDays: 7 },
+  { name: 'AI Snake Oil', track: 'AI 趨勢觀點', url: 'https://www.aisnakeoil.com/feed', maxAgeDays: 7 },
+  { name: "Where's Your Ed At", track: 'AI 趨勢觀點', url: 'https://www.wheresyoured.at/rss/', maxAgeDays: 7 },
+  { name: 'Don\'t Worry About the Vase', track: 'AI 趨勢觀點', url: 'https://thezvi.substack.com/feed', maxAgeDays: 7 },
+  // 實測 2026-09-17 沒接的：a16z（/feed/ 404）、The Batch（/the-batch/feed/ 404）、Epoch AI（無 RSS）、
+  // every.to（feed 是空的）、曼報（manny-li.com 403、substack 空）。
+  // 沒接 Lenny's：內容是產品／成長，AI 只是順帶，接了會被打低分白吃名額。
   // —— 國際科技媒體：中文媒體的上游，直接接原文，不要等人翻 ——
   { name: 'TechCrunch', track: '國際科技', url: 'https://techcrunch.com/feed/' },
   { name: 'The Verge', track: '國際科技', url: 'https://www.theverge.com/rss/index.xml' },
@@ -126,8 +154,9 @@ const HN_LIMIT = 6
 // 兩段各有自己的上限：打分用 8B 很便宜，可以多看一點；寫草稿的 70B 才是花錢的地方。
 // 以前共用一個 8 的上限，等於「排在前面的來源先填滿就結束」——HN 4 則＋OpenAI 4 則剛好吃光，
 // 中文來源永遠輪不到，所以抓回來的全是英文。
-// SCAN_CAP 跟來源數綁在一起：33 條來源輪流取，20 個名額等於一半的來源分不到任何一則。
-const SCAN_CAP = 64 // 進第一階段打分的則數（33 條來源 × 約 2 則）
+// SCAN_CAP 跟來源數綁在一起：來源輪流取，名額比來源數少太多就等於一半的來源分不到任何一則。
+// 加了 18 條趨勢觀點來源之後從 64 開到 96（51 條來源 × 約 2 則），打分批數 8 → 12，8B 模型撐得住。
+const SCAN_CAP = 96 // 進第一階段打分的則數
 // 進第二階段寫摘要的則數。草稿移到前端點了才生之後，這段從 1800 token 縮到 500，
 // 同樣的錢可以多看兩倍——所以名額從 8（閃 Groq 免費額度的舊值）開到 20。
 const WRITE_CAP = 20
@@ -136,13 +165,19 @@ const WRITE_CAP = 20
 const SCORE_CONCURRENCY = 2
 const REWRITE_CONCURRENCY = 6 // 第二階段（寫摘要）同時幾則：20 則分四輪打完
 const MIN_SCORE = 6
+// 各分類在 WRITE_CAP 裡的保底／封頂（過門檻的才算，過不了門檻保底也不會硬塞）。
+// 沒列的分類保底 1、不封頂。用法見 fetchNewsCandidates 挑 worthy 那段。
+const TRACK_QUOTA: Record<string, { min?: number; max?: number }> = {
+  'AI 趨勢觀點': { min: 6 },
+  '工程/開發': { max: 4 },
+}
 
 // 兩階段的省錢邏輯不在「換小模型」，而在「量」：
 // 第一階段一則只產出編號＋分數（約 30 token），第二階段才寫摘要＋3 草稿（1800 token），
 // 而且只有 WRITE_CAP 則走得到第二階段。模型統一交給 lib/llm-json 決定（OPENROUTER_MODEL 可覆寫）。
 
-// 打分要整批送，不能一則一次。來源開到 33 條之後 SCAN_CAP 是 64，
-// 一則一次呼叫就是 64 次請求，實測直接撞每分鐘上限（429）。整批送只要 8 次。
+// 打分要整批送，不能一則一次。來源開到 33 條之後 SCAN_CAP 是 64（現在 51 條、96 則），
+// 一則一次呼叫就是 64 次請求，實測直接撞每分鐘上限（429）。整批送只要 8 次（現在 12 次）。
 // 順帶好處：模型看得到同一批的其他則，有比較基準，分數才拉得開——
 // 一則一則問的時候沒有基準，實測會整批都給 8 分，MIN_SCORE 等於沒作用。
 const SCORE_BATCH = 8
@@ -152,8 +187,13 @@ const SCORE_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐�
 分數是 0 到 10 的整數：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。
 同一批裡分數必須拉開，不可以全部給一樣的分數；如果整批都很普通，就照相對高低給 3 到 6。
 
-一個特例，看我給的「分類」欄：分類是「政府一手」時，這是公告不是新聞，不要用話題性評。
-有明確申請對象、補助金額或截止日的補助／徵件／計畫徵求給 7 分以上；純徵才職缺、內部行政、得獎名單、活動花絮給 2 分。
+單一工具的功能介紹要壓低：「某產品推出某功能」「某版本發布」「某平台新增整合」這類只有用那個工具的人才在乎的，給 3 到 5；
+只有改變整個領域格局的發布（新一代模型、價格砍半、開源了原本閉源的東西）才給 7 以上。
+反過來，有趨勢判斷、產業分析、方法論、或明確反方意見的文章，就算不是「今天發生的事」也給 7 以上——讀者要的是看法，不是產品目錄。
+
+兩個特例，看我給的「分類」欄：
+分類是「政府一手」時，這是公告不是新聞，不要用話題性評。有明確申請對象、補助金額或截止日的補助／徵件／計畫徵求給 7 分以上；純徵才職缺、內部行政、得獎名單、活動花絮給 2 分。
+分類是「AI 趨勢觀點」時，評的是論點：有新的判斷、能引發討論、跟台灣接案或工程現場對得上的給 7 以上；每週例行的新聞彙整、podcast 預告、只重述別人新聞的給 4 以下。
 
 回傳 JSON：{"結果":[{"編號":1,"分數":8}]}
 每一則都要回，編號要跟我給的一致，不可省略或合併。不要寫任何理由。只回 JSON。`
@@ -163,10 +203,13 @@ const SCORE_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐�
 const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編，同時也幫他過濾哪些新聞值得另外寫成中文部落格長文。我會給你一則科技新聞，請做兩件事：判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值並寫摘要；再判斷它適不適合改寫成長文。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要、適合改寫、改寫建議。
 
 分數是 0 到 10 的整數，代表這則新聞的分享價值：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。
+單一工具的功能介紹（某產品推出某功能、某版本發布）只有用那個工具的人才在乎，給 3 到 5；改變整個領域格局的發布才給 7 以上。有趨勢判斷、產業分析、方法論或反方意見的文章給 7 以上。
 特例：分類是「政府一手」時這是公告不是新聞，有明確申請對象、補助金額或截止日的給 7 分以上；純徵才、內部行政、得獎名單給 2 分。
+分類是「AI 趨勢觀點」時評的是論點：有新判斷、能引發討論的給 7 以上；例行新聞彙整、podcast 預告給 4 以下。
 
 摘要：用繁體中文 200 到 300 字說明這則新聞，先講發生了什麼事、再補重點細節與背景、最後帶為什麼值得關注，分 2 到 3 段寫清楚來龍去脈，讓人不點原文也能完整看懂（英文新聞也要翻成中文摘要）。
 分類是「政府一手」時，摘要要寫清楚「誰可以申請、什麼時候截止、給多少」，這比背景重要。
+分類是「AI 趨勢觀點」時，摘要要寫清楚「作者的論點是什麼、憑什麼這樣說、跟主流看法差在哪」，不要寫成事件報導。
 不可以只把標題換句話說；我給的原始摘要很短甚至空白時，就用你對這個領域的常識補背景，但不可以編造數字、日期或引述。
 
 適合改寫：布林值。純技術新聞（新版本發布、公司併購、募資新聞、公告）沒有觀點好切，給 false；有明確論點、方法論、或作者踩坑心得，能延伸出台灣場景對比、反方論點、實戰案例這類討論空間的，才給 true。分類是「政府一手」時一律 false。
@@ -742,6 +785,7 @@ export async function fetchNewsCandidates(): Promise<{
   // 一批失敗（額度用完／壞 JSON）只丟那一批，不要整輪炸掉；429 仍然往外丟給前端說明。
   const scores = new Map<number, number>()
   const offsets: number[] = []
+  let lastScoreError: unknown = null
   for (let i = 0; i < picked.length; i += SCORE_BATCH) offsets.push(i)
   for (let i = 0; i < offsets.length; i += SCORE_CONCURRENCY) {
     const got = await Promise.all(
@@ -749,11 +793,18 @@ export async function fetchNewsCandidates(): Promise<{
         scoreBatch(picked.slice(off, off + SCORE_BATCH), off).catch((e) => {
           const rl = asRateLimit(e)
           if (rl) throw rl
+          lastScoreError = e
           return new Map<number, number>()
         })
       )
     )
     for (const m of got) for (const [k, v] of m) scores.set(k, v)
+  }
+  // 每一批都炸（金鑰失效、模型名打錯）跟「今天全是低分」在畫面上長得一模一樣：都是 0 則。
+  // 實測 2026-09-17 就是這樣——OpenRouter 回 401，畫面只看到「送打分 96、低分 96」。
+  // 一批失敗可以吞，全部失敗要講出來。
+  if (picked.length && !scores.size && lastScoreError) {
+    throw new Error(`AI 打分全部失敗：${llmErrorMessage(lastScoreError)}`)
   }
   // 過門檻的照分數排，名額憑分數搶，不是憑來源排在前面
   const passed = picked
@@ -763,22 +814,29 @@ export async function fetchNewsCandidates(): Promise<{
 
   // 但純憑分數會犧牲多樣性：AI/LLM 那類天生分數高，實測 8 個名額全被它跟工程/開發吃光，
   // 政府一手（補助徵件，7 分）明明過了門檻卻一則都上不了——那正是這個工具要看的東西。
-  // 所以先讓每個分類各拿一則最高分的，剩下的名額再純憑分數搶。
+  // 所以先讓每個分類拿到保底名額（沒特別寫的分類保底 1 則），剩下的名額再純憑分數搶，
+  // 搶的時候有上限的分類到頂就跳過。
+  // 趨勢觀點保底 6：它們是長文、看法，「分享價值」天生比不過 OpenAI 發新模型那種硬新聞，
+  // 只保 1 則的話畫面還是整排產品公告。工程/開發封頂 4：這一組來源全是平台自己的功能公告，
+  // 就是使用者嫌「太多單一工具介紹」的主因。
   const worthy: Parsed[] = []
   const taken = new Set<Parsed>()
-  const seenTracks = new Set<string>()
-  for (const x of passed) {
-    if (worthy.length >= WRITE_CAP) break
-    if (seenTracks.has(x.n.類型)) continue
-    seenTracks.add(x.n.類型)
+  const perTrack = new Map<string, number>()
+  const count = (x: { n: Parsed }) => {
     taken.add(x.n)
     worthy.push(x.n)
+    perTrack.set(x.n.類型, (perTrack.get(x.n.類型) ?? 0) + 1)
+  }
+  for (const x of passed) {
+    if (worthy.length >= WRITE_CAP) break
+    if ((perTrack.get(x.n.類型) ?? 0) >= (TRACK_QUOTA[x.n.類型]?.min ?? 1)) continue
+    count(x)
   }
   for (const x of passed) {
     if (worthy.length >= WRITE_CAP) break
     if (taken.has(x.n)) continue
-    taken.add(x.n)
-    worthy.push(x.n)
+    if ((perTrack.get(x.n.類型) ?? 0) >= (TRACK_QUOTA[x.n.類型]?.max ?? Infinity)) continue
+    count(x)
   }
 
   // 把 Google News 轉址還原成原文乾淨網址（其餘來源原樣）。
