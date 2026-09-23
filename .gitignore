@@ -16,3 +16,4 @@ next-env.d.ts
 /data/signal-log
 /data/watchlist.json
 /data/news-push
+/data/trends-cache.json

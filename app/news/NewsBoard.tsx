@@ -27,6 +27,17 @@ const stripUrls = (s: string) =>
 const heatTip = (c: Candidate) => {
   const h = c.熱度明細
   if (!h) return ''
+  // Google Trends 那條線：搜尋量用「是 Claude AI 的幾倍」講（台灣、全球各一個），再加最猛的漲幅
+  if (h.台灣 !== undefined || h.全球 !== undefined) {
+    return [
+      h.台灣 ? `台灣搜尋量是 Claude AI 的 ${h.台灣.toFixed(1)} 倍` : '台灣沒資料',
+      h.全球 ? `全球 ${h.全球.toFixed(2)} 倍` : '',
+      h.漲幅 ? `竄升 ${h.漲幅}` : '',
+      h.搜尋詞?.length ? `大家搜「${h.搜尋詞.slice(0, 3).join('」「')}」` : '',
+    ]
+      .filter(Boolean)
+      .join('・')
+  }
   return [
     `${h.來源數} 個來源在講`,
     h.hn ? `HN ${h.hn} 分（${h.hn篇數} 篇）` : '',
@@ -51,6 +62,7 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [fetching, setFetching] = useState(false)
   const [onlyRewrite, setOnlyRewrite] = useState(false)
   const [posted, setPosted] = useState<PostedLog[]>(history)
+  const [mode, setMode] = useState('') // 這次是用 Google Trends 找的，還是退回新聞來源
 
   // 以前分「中文／英文」兩區：改成熱度排序後，這樣分會打亂順序（代表文章剛好是中文的話題永遠排前面），
   // 而且每個話題都有中文標題了。改分「熱門話題（照熱度）」和「政府公告（照截止日）」兩區。
@@ -67,6 +79,7 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
       if (res.ok && json.ok) {
         const items: Candidate[] = json.items || []
         setCandidates(items)
+        setMode(json.report?.模式 || '')
         setDrafts(Object.fromEntries(items.map((c) => [c.原文連結, emptyDrafts()])))
         setTab(Object.fromEntries(items.map((c) => [c.原文連結, '感性' as VKey])))
         setWithImg(Object.fromEntries(items.map((c) => [c.原文連結, c.配圖 === '是' && !!c.圖片連結])))
@@ -387,6 +400,12 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
           </button>
         )}
       </div>
+
+      {mode && candidates.length > 0 && (
+        <p className={`text-xs ${mode.startsWith('Google') ? 'text-slate-500' : 'text-amber-400'}`}>
+          這次的熱門話題來自：{mode}
+        </p>
+      )}
 
       {candidates.length === 0 && (
         <p className="text-sm text-slate-500">按「抓最新新聞」開始。候選只留在這頁，重新整理就會清掉；發出去的會記在下方。</p>

@@ -36,6 +36,11 @@ export type Heat = {
   // 五角大廈那則 HN 搜到的兩篇都對，Google News 卻混了一半別的五角大廈新聞，一起算會把準的那個也拖下去。
   hn相關度: number
   新聞相關度: number // Google Trends 也乘這個（一般人的搜尋跟媒體報導是同一群人）
+  // 以下只有「從 Google Trends 找話題」那條線有（lib/news-trends）：搜尋量是對照詞 Claude AI 的幾倍、最猛的漲幅、原始搜尋詞
+  台灣?: number | null
+  全球?: number | null
+  漲幅?: string
+  搜尋詞?: string[]
 }
 
 export type Topic = {

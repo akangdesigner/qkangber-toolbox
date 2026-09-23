@@ -10,7 +10,7 @@
 // 一天 4 次約一個月 US$8，別排到每小時。
 import { promises as fs } from 'fs'
 import path from 'path'
-import { govCandidates, trendingTopics, toCandidates } from '../lib/news-fetch'
+import { govCandidates, hotTopics, toCandidates } from '../lib/news-fetch'
 import { lineConfigured, pushLine, type LineMessage } from '../lib/line'
 import type { Candidate } from '../lib/news-fetch'
 
@@ -45,10 +45,13 @@ function format(c: Candidate): LineMessage {
   if (!c.熱度明細) return formatGov(c)
   const h = c.熱度明細
   const signals = [
+    h.台灣 ? `台灣搜尋量 ${h.台灣.toFixed(1)} 倍` : '',
+    h.全球 ? `全球 ${h.全球.toFixed(2)} 倍` : '',
+    h.漲幅 ? `竄升 ${h.漲幅}` : '',
     h.來源數 > 1 ? `${h.來源數} 個來源` : '',
     h.hn ? `HN ${h.hn} 分` : '',
     h.新聞 ? `${h.新聞} 篇報導` : '',
-    h.搜尋 ? `搜尋量 Claude AI 的 ${Math.round(h.搜尋 * 100)}%` : '',
+    h.搜尋 && h.台灣 === undefined ? `搜尋量 Claude AI 的 ${Math.round(h.搜尋 * 100)}%` : '',
   ].filter(Boolean)
   const text = [
     `🔥 熱度 ${c.分數}｜${c.中文標題 || c.話題}`,
@@ -70,7 +73,7 @@ async function main() {
   if (!dry && !lineConfigured()) throw new Error('.env 沒設 LINE_CHANNEL_ACCESS_TOKEN／LINE_USER_ID（先用 --dry 測）')
   const pushed: Pushed = JSON.parse(await fs.readFile(LOG, 'utf8').catch(() => '{}'))
 
-  const [{ topics }, gov] = await Promise.all([trendingTopics(), govCandidates()])
+  const [{ topics, 模式 }, gov] = await Promise.all([hotTopics(), govCandidates()])
   const hot = topics.filter((t) => t.熱度 >= MIN_HEAT)
   const recent = (key: string) => {
     const p = pushed[key]
@@ -80,7 +83,7 @@ async function main() {
   // 公告不設 7 天過期：同一則公告推過就永遠不再推
   const govFresh = gov.items.filter((c) => c.分數 >= GOV_MIN_SCORE && !pushed[c.原文連結])
   console.log(
-    `[news-push] ${now.toISOString()} 話題 ${topics.length}，熱度 ≥ ${MIN_HEAT} 的 ${hot.length} 個` +
+    `[news-push] ${now.toISOString()}（${模式}）話題 ${topics.length}，熱度 ≥ ${MIN_HEAT} 的 ${hot.length} 個` +
       `（${hot.map((t) => `${t.話題} ${t.熱度}`).join('、') || '無'}），沒推過的 ${fresh.length} 個；` +
       `政府公告 ${gov.items.length} 則過板上門檻，≥ ${GOV_MIN_SCORE} 分沒推過的 ${govFresh.length} 則${dry ? '（--dry）' : ''}`
   )

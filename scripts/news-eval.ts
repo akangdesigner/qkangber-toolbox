@@ -9,7 +9,7 @@
 // 過了那週就另外寫一份新的，不要拿舊的硬比。
 import { promises as fs } from 'fs'
 import path from 'path'
-import { trendingTopics } from '../lib/news-fetch'
+import { hotTopics } from '../lib/news-fetch'
 
 type Fixture = {
   第一名: string
@@ -27,16 +27,26 @@ async function main() {
   console.log(`[eval] 對照檔 ${path.basename(file)}`)
 
   const t0 = Date.now()
-  const { topics, articles, 來源 } = await trendingTopics()
-  console.log(`[eval] 抓到 ${articles} 篇 → ${topics.length} 個話題（${((Date.now() - t0) / 1000).toFixed(0)}s）`)
+  const { topics, 模式, articles, 來源 } = await hotTopics()
+  console.log(`[eval] ${模式}：${articles ? `抓到 ${articles} 篇 → ` : ''}${topics.length} 個話題（${((Date.now() - t0) / 1000).toFixed(0)}s）`)
   const broken = 來源.filter((s) => s.狀態 !== 'ok' || s.收下 === 0)
   if (broken.length) console.log(`[eval] 沒收到東西的來源：${broken.map((s) => `${s.名稱}(${s.狀態})`).join('、')}`)
 
   const trendsOK = topics.some((t) => t.明細.搜尋 !== null)
   if (!trendsOK) console.log('[eval] ⚠ Google Trends 沒抓到（被擋？），熱度只用 HN＋新聞兩個訊號')
 
-  console.log('\n排名  熱度   HN分(篇)    新聞  搜尋  來源  話題（查詢；#＝事件，*＝籠統、沒拿去外部搜）')
-  topics.slice(0, 25).forEach((t, i) => {
+  if (模式 === 'Google Trends') {
+    console.log('\n排名  熱度   台灣    全球    漲幅            話題（大家搜的詞）')
+    topics.slice(0, 25).forEach((t, i) => {
+      const h = t.明細
+      console.log(
+        `${String(i + 1).padStart(3)}   ${String(t.熱度).padStart(3)}   ${h.台灣 == null ? '  -  ' : h.台灣.toFixed(2).padStart(5)}   ${
+          h.全球 == null ? '  -  ' : h.全球.toFixed(2).padStart(5)
+        }   ${(h.漲幅 ?? '').padEnd(14)}  ${t.話題}（${(h.搜尋詞 ?? []).slice(0, 3).join('、')}）`
+      )
+    })
+  } else console.log('\n排名  熱度   HN分(篇)    新聞  搜尋  來源  話題（查詢；#＝事件，*＝籠統、沒拿去外部搜）')
+  if (模式 !== 'Google Trends') topics.slice(0, 25).forEach((t, i) => {
     const h = t.明細
     console.log(
       `${String(i + 1).padStart(3)}   ${String(t.熱度).padStart(3)}   ${String(h.hn).padStart(5)}(${String(h.hn篇數).padStart(2)})   ${String(h.新聞).padStart(4)}  ${

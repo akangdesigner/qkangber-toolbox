@@ -10,6 +10,8 @@ import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
 import { getPostedLog, twTime } from '@/lib/news'
 import { cleanStoryText } from '@/lib/hn-fetch'
 import { clusterTopics, rankTopics, zhCoverage, type Article, type Heat, type Topic } from '@/lib/news-trending'
+import { trendsTopics } from '@/lib/news-trends'
+import { TrendsBlockedError } from '@/lib/google-trends'
 
 type Feed = { name: string; track: string; url: string; max?: number } // max：這條收幾則，預設 PER_FEED
 
@@ -407,6 +409,7 @@ function isFresh(發布時間: string): boolean {
 }
 
 export type FetchReport = {
+  模式: string // 「Google Trends」或「新聞來源（Trends 被擋）」，前端要講清楚這次是怎麼找的
   抓到: number
   話題: number
   來源: { 名稱: string; 收下: number; 狀態: string }[]
@@ -552,6 +555,24 @@ export async function trendingTopics(): Promise<{ topics: Topic[]; articles: num
   return { topics, articles: articles.length, 來源 }
 }
 
+// 找熱門話題：先用 Google Trends（大家在搜什麼，見 lib/news-trends），
+// 被擋或找不到東西就退回新聞來源那套（先抓新聞、再量熱度），板子不會空掉。
+export async function hotTopics(): Promise<{ topics: Topic[]; 模式: string; articles: number; 來源: FetchReport['來源'] }> {
+  try {
+    const topics = await trendsTopics()
+    if (topics.length >= 3) return { topics, 模式: 'Google Trends', articles: 0, 來源: [] }
+  } catch (e) {
+    if (!(e instanceof TrendsBlockedError)) {
+      const rl = asRateLimit(e)
+      if (rl) throw rl
+    }
+    // 其他錯誤（Trends 格式變了、LLM 回壞 JSON）一樣退回，不讓整輪掛掉
+    console.error('[news] Google Trends 失敗，退回新聞來源：', String(e).slice(0, 200))
+  }
+  const r = await trendingTopics()
+  return { topics: r.topics, 模式: '新聞來源（Google Trends 被擋或沒資料）', articles: r.articles, 來源: r.來源 }
+}
+
 // 話題 → 候選：挑代表連結、找台灣中文報導、寫摘要
 export async function toCandidates(topics: Topic[]): Promise<Candidate[]> {
   const out: (Candidate | null)[] = []
@@ -617,10 +638,10 @@ export async function fetchNewsCandidates(): Promise<{
 }> {
   const posted = await getPostedLog().catch(() => [])
   // 兩條線並行：政府公告那條只有一次 LLM 呼叫，不該讓熱門話題等它
-  const [{ topics, articles, 來源 }, gov] = await Promise.all([trendingTopics(), govCandidates()])
+  const [{ topics, 模式, articles, 來源 }, gov] = await Promise.all([hotTopics(), govCandidates()])
   const fresh = topics.filter((t) => !alreadyPosted(t, posted)).slice(0, WRITE_CAP)
   const hot = await toCandidates(fresh)
   const postedUrls = new Set(posted.map((p) => p.原文連結))
   const items = [...hot, ...gov.items.filter((c) => !postedUrls.has(c.原文連結))]
-  return { items, scanned: articles, report: { 抓到: articles, 話題: topics.length, 來源: [...來源, ...gov.來源] } }
+  return { items, scanned: articles, report: { 模式, 抓到: articles, 話題: topics.length, 來源: [...來源, ...gov.來源] } }
 }
