@@ -23,7 +23,19 @@ const emptyDrafts = (): Record<VKey, string> => ({ 感性: '', 技術: '', 討�
 
 const stripUrls = (s: string) =>
   (s || '').replace(/https?:\/\/\S+/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-const hasCJK = (s: string) => /[一-鿿]/.test(s)
+// 熱度是四個訊號合成的，光一個數字看不出「為什麼紅」，把明細攤開
+const heatTip = (c: Candidate) => {
+  const h = c.熱度明細
+  if (!h) return ''
+  return [
+    `${h.來源數} 個來源在講`,
+    h.hn ? `HN ${h.hn} 分（${h.hn篇數} 篇）` : '',
+    h.新聞 ? `${h.新聞} 篇報導` : '',
+    h.搜尋 !== null && h.搜尋 > 0 ? `搜尋量是 Claude AI 的 ${Math.round(h.搜尋 * 100)}%` : '',
+  ]
+    .filter(Boolean)
+    .join('・')
+}
 const domainOf = (u: string) => (u.match(/https?:\/\/([^/]+)/)?.[1] || u).replace(/^www\./, '')
 
 export default function NewsBoard({ history }: { history: PostedLog[] }) {
@@ -37,13 +49,14 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [saving, setSaving] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
-  const [lang, setLang] = useState<'all' | 'zh' | 'en'>('all')
   const [onlyRewrite, setOnlyRewrite] = useState(false)
   const [posted, setPosted] = useState<PostedLog[]>(history)
 
+  // 以前分「中文／英文」兩區：改成熱度排序後，這樣分會打亂順序（代表文章剛好是中文的話題永遠排前面），
+  // 而且每個話題都有中文標題了。改分「熱門話題（照熱度）」和「政府公告（照截止日）」兩區。
   const rewriteFiltered = onlyRewrite ? candidates.filter((c) => c.適合改寫) : candidates
-  const zh = rewriteFiltered.filter((c) => hasCJK(c.標題))
-  const en = rewriteFiltered.filter((c) => !hasCJK(c.標題))
+  const hot = rewriteFiltered.filter((c) => c.類型 !== '政府一手')
+  const gov = onlyRewrite ? [] : candidates.filter((c) => c.類型 === '政府一手')
   const rewriteCount = candidates.filter((c) => c.適合改寫).length
 
   async function runFetch() {
@@ -209,7 +222,16 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
               <span className={`px-2 py-0.5 rounded-full border ${typeColor[c.類型] || 'bg-white/10 text-slate-300 border-white/20'}`}>
                 {c.類型 || '未分類'}
               </span>
-              <span className="text-slate-500">分數 {c.分數}</span>
+              {c.熱度明細 ? (
+                <span className="px-2 py-0.5 rounded-full border bg-orange-500/15 text-orange-300 border-orange-500/30">
+                  🔥 熱度 {c.分數}
+                </span>
+              ) : (
+                <span className="text-slate-500">可申請度 {c.分數}</span>
+              )}
+              {c.截止日 && (
+                <span className="px-2 py-0.5 rounded-full border bg-rose-500/15 text-rose-300 border-rose-500/30">⏰ 截止 {c.截止日}</span>
+              )}
               {c.適合改寫 && (
                 <span className="px-2 py-0.5 rounded-full border bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30">
                   ✍️ 適合改寫
@@ -218,7 +240,9 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
               <span className="text-slate-500">{c.來源}</span>
               {c.時間 && <span className="ml-auto text-slate-500">🕒 {c.時間}</span>}
             </div>
-            <h3 className="text-lg font-semibold text-white leading-snug mb-2">{c.標題}</h3>
+            <h3 className="text-lg font-semibold text-white leading-snug mb-1">{c.中文標題 || c.標題}</h3>
+            {c.中文標題 && <p className="text-xs text-slate-500 mb-2">{c.標題}</p>}
+            {c.熱度明細 && <p className="text-xs text-slate-500 mb-2">{heatTip(c)}</p>}
             {c.摘要 && <p className="text-sm text-slate-400 leading-relaxed mb-3">{c.摘要}</p>}
             {c.適合改寫 && c.改寫建議 && <p className="text-sm text-violet-300 mb-3">✍️ {c.改寫建議}</p>}
             {c.圖片連結 && (
@@ -254,6 +278,16 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
             {c.原文連結 && (
               <a href={c.原文連結} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-violet-400 hover:text-violet-300 break-all">
                 原文：{domainOf(c.原文連結)} ↗
+              </a>
+            )}
+            {c.中文報導 && (
+              <a
+                href={c.中文報導.連結}
+                target="_blank"
+                rel="noreferrer"
+                className="block mt-1 text-sm text-emerald-400 hover:text-emerald-300 break-all"
+              >
+                中文報導：{c.中文報導.標題} ↗
               </a>
             )}
           </div>
@@ -342,25 +376,6 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
         >
           {fetching ? '抓取中…（約 1-2 分鐘）' : '抓最新新聞'}
         </button>
-        {candidates.length > 0 && (
-          <div className="flex gap-1.5">
-            {([
-              ['all', `全部 ${rewriteFiltered.length}`],
-              ['zh', `🇹🇼 中文 ${zh.length}`],
-              ['en', `🌐 英文 ${en.length}`],
-            ] as const).map(([k, label]) => (
-              <button
-                key={k}
-                onClick={() => setLang(k)}
-                className={`px-3 py-1 rounded-full text-xs border transition-colors ${
-                  lang === k ? 'bg-violet-600 border-violet-500 text-white' : 'bg-white/5 border-white/10 text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        )}
         {rewriteCount > 0 && (
           <button
             onClick={() => setOnlyRewrite((v) => !v)}
@@ -377,17 +392,17 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
         <p className="text-sm text-slate-500">按「抓最新新聞」開始。候選只留在這頁，重新整理就會清掉；發出去的會記在下方。</p>
       )}
 
-      {lang !== 'en' && zh.length > 0 && (
+      {hot.length > 0 && (
         <section>
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">🇹🇼 中文新聞（{zh.length}）</h2>
-          <div className="space-y-6">{zh.map((c) => Card(c))}</div>
+          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">🔥 熱門話題（{hot.length}，照熱度排）</h2>
+          <div className="space-y-6">{hot.map((c) => Card(c))}</div>
         </section>
       )}
 
-      {lang !== 'zh' && en.length > 0 && (
+      {gov.length > 0 && (
         <section>
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">🌐 英文新聞（{en.length}）</h2>
-          <div className="space-y-6">{en.map((c) => Card(c))}</div>
+          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">🏛 政府公告（{gov.length}，照截止日排）</h2>
+          <div className="space-y-6">{gov.map((c) => Card(c))}</div>
         </section>
       )}
 

@@ -15,3 +15,4 @@ next-env.d.ts
 # 訊號日誌與自選清單備份：本機執行期資料，不進版控
 /data/signal-log
 /data/watchlist.json
+/data/news-push

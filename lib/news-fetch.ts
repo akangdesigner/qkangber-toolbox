@@ -1,115 +1,99 @@
-// 抓最新科技新聞 → AI 改寫成 3 種 Threads 草稿 → 回傳候選（不寫表，留前端）
+// 抓最近一週的 AI 新聞 → 併成話題 → 用外部熱度排序 → 最熱的幾個寫摘要 → 回傳候選（不寫表，留前端）
 // 走 lib/llm-json 的共用入口：有 OPENROUTER_API_KEY 就用 OpenRouter，沒有才退回 Groq。
 // 別直接呼叫 getGroqClient——那會繞過這個切換，把請求全打在 Groq 的免費額度上（實測整輪 429）。
+//
+// 2026-09-23 改版：以前是「每則文章讓 LLM 評分享價值 → 各來源輪流分名額 → 各分類保底」，
+// 對照當週真正紅的 9 個話題只上板 2 個（最熱的 Jev 被打 5-6 分、Enigma／五角大廈被來源輪流取砍掉）。
+// 現在 LLM 只負責「哪些文章在講同一件事」和寫摘要，「重不重要」交給外部熱度（見 lib/news-trending）。
+// 改這支之前後都要跑 scripts/news-eval.ts，看熱門話題的召回率，不要只看「抓到幾則」。
 import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
 import { getPostedLog, twTime } from '@/lib/news'
 import { cleanStoryText } from '@/lib/hn-fetch'
+import { clusterTopics, rankTopics, zhCoverage, type Article, type Heat, type Topic } from '@/lib/news-trending'
 
-// minScore／maxAgeDays 是「這個來源用不同的尺」：
-// 政府補助公告不該用「分享價值」評分，時效也不是兩天（看的是申請截止日，不是發布日）。
-type Feed = { name: string; track: string; url: string; minScore?: number; maxAgeDays?: number }
+type Feed = { name: string; track: string; url: string; max?: number } // max：這條收幾則，預設 PER_FEED
 
-// 候選（只活在前端，發出去才寫進發文紀錄）
+// 候選（只活在前端，發出去才寫進發文紀錄）。一則候選＝一個話題，連結是話題裡最像第一手的那篇。
 export type Candidate = {
-  時間: string // 新聞發布時間，台灣時間精確到小時
+  時間: string // 代表文章的發布時間，台灣時間精確到小時
   類型: string
-  分數: number
+  分數: number // 熱度 0-100（欄位名沿用舊的，發文紀錄與前端都認這個）
+  話題: string
+  熱度明細: Heat | null // 政府公告沒有熱度（見 GOV_FEEDS），是 null
+  相關文章: number // 抓到幾篇在講這件事
+  截止日: string // 政府公告的申請截止日 YYYY-MM-DD；熱門話題或公告沒寫是空字串
   標題: string
+  中文標題: string
   來源: string
   原文連結: string
+  中文報導: { 標題: string; 連結: string } | null
   圖片連結: string
   配圖: string
   摘要: string
-  適合改寫: boolean // 值不值得另外寫成部落格長文（原「文章靈感」分頁的判斷，併進來跟分享價值一起評）
-  改寫建議: string // 適合改寫為 true 時的切角度建議；false 時是空字串
-  // 三種風格的草稿不在這裡生。使用者在前端點了風格才呼叫 /api/news/draft，
-  // 避免幫沒人要看的新聞先寫三篇（一篇約 1.6k token）。
+  適合改寫: boolean
+  改寫建議: string
 }
 
-const MAX_AGE_DAYS = 2 // 預設：超過兩天的新聞不收（單一來源可用 maxAgeDays 放寬）
-// 天花板：不管來源自己寫幾天，超過七天的一律不收。
-// 沒有這條的話，政府公告那種 14 天窗口會在畫面上放進上個月的則數，看起來像抓錯。
-// 新增來源時也不必再一條一條檢查——isFresh 會把任何超過這個值的窗口夾回來。
-const HARD_MAX_AGE_DAYS = 7
+// 所有來源一律看 7 天：話題會紅一整週（Jev 9/15 發表、9/23 還是最熱），
+// 兩天的窗口只看得到話題的尾巴或開頭。熱度另外由 lib/news-trending 量，這裡只負責「找到有哪些事」。
+const MAX_AGE_DAYS = 7
 
-// 只收第一手：發布者自己講的，或記者自己採訪的。
-// 不收純翻譯層（INSIDE／科技報橘／TechNews／Google News 聚合）——他們的稿子出處欄寫的就是下面這幾家
-// （實測 2026-08-03：INSIDE 引 Reuters/The Verge/TechCrunch/Engadget，科技報橘引 The Information/FT/DeepMind），
-// 等於多繞一層又慢 6-24 小時、技術細節還被磨掉。
-// 順序不影響取用（interleaveBySource 是輪流取），只是分組讓人看得懂。
+// 來源只負責「發現話題」，排序不看來源。所以這裡要的是覆蓋面，不是純度：
+// 以前為了「只收第一手」拿掉聚合來源，連帶丟掉最重要的訊號——很多地方同時在講。
 const FEEDS: Feed[] = [
-  // —— AI 官方第一手（英文，Groq 會翻成中文草稿）——
-  // 官方 blog 一週才發幾篇，兩天的窗口會讓這幾條長期回 0 則，所以一律放寬到 7 天。
-  { name: 'OpenAI 官方', track: 'AI/LLM', url: 'https://openai.com/news/rss.xml', maxAgeDays: 7 },
-  { name: 'Google Gemini 官方', track: 'AI/LLM', url: 'https://blog.google/products/gemini/rss/', maxAgeDays: 7 },
-  { name: 'Google 官方', track: 'AI/LLM', url: 'https://blog.google/rss/', maxAgeDays: 7 },
-  { name: 'Google DeepMind', track: 'AI/LLM', url: 'https://deepmind.google/blog/rss.xml', maxAgeDays: 7 },
-  { name: 'Google Research', track: 'AI/LLM', url: 'https://research.google/blog/rss/', maxAgeDays: 7 },
-  { name: 'NVIDIA 官方', track: 'AI/LLM', url: 'https://blogs.nvidia.com/feed/', maxAgeDays: 7 },
-  { name: 'Hugging Face', track: 'AI/LLM', url: 'https://huggingface.co/blog/feed.xml', maxAgeDays: 7 },
-  { name: 'AWS ML', track: 'AI/LLM', url: 'https://aws.amazon.com/blogs/machine-learning/feed/', maxAgeDays: 7 },
-  { name: 'Microsoft Research', track: 'AI/LLM', url: 'https://www.microsoft.com/en-us/research/feed/', maxAgeDays: 7 },
-  { name: 'Apple ML', track: 'AI/LLM', url: 'https://machinelearning.apple.com/rss.xml', maxAgeDays: 7 },
-  // Anthropic 沒有 RSS（/news/rss.xml、/rss.xml、/feed.xml 都 404），改抓 /news 列表頁，見 SCRAPERS。
-  // 別再用 Google News 搜「Anthropic OR Claude」代打：實測抓回來全是 TechNews／INSIDE／T客邦，
-  // 等於從後門把二手媒體放回來。
-  // —— 社群一手：新模型常常先在這裡被人跑過，才輪到媒體寫 ——
-  { name: 'r/LocalLLaMA', track: 'AI/LLM', url: 'https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day' },
+  // —— 熱門聚合：別人已經幫忙挑過「今天在紅什麼」——
+  // The Rundown AI 是每日 AI 日報，實測 2026-09-23 標題就有 Jev、Muse、AI 放緩爭論，舊來源清單全漏
+  { name: 'The Rundown AI', track: 'AI/LLM', url: 'https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml' },
+  // Google News 的 AI 主流報導：只當「發現話題」用（連結是轉址，代表連結排最後，見 representative）。
+  // 沒有這條的話，「AI 大廠呼籲放緩」「Gemini 測試中連上外部系統」這種主流媒體大篇幅報、工程圈來源沒寫的事整個看不到。
+  { name: 'Google News AI', track: '國際科技', url: 'https://news.google.com/rss/search?q=%22artificial+intelligence%22+OR+AI+when:3d&hl=en-US&gl=US&ceid=US:en', max: 60 },
+  // —— AI 官方第一手：話題的「原文連結」優先用這些 ——
+  { name: 'OpenAI 官方', track: 'AI/LLM', url: 'https://openai.com/news/rss.xml' },
+  { name: 'Google Gemini 官方', track: 'AI/LLM', url: 'https://blog.google/products/gemini/rss/' },
+  { name: 'Google 官方', track: 'AI/LLM', url: 'https://blog.google/rss/' },
+  { name: 'Google DeepMind', track: 'AI/LLM', url: 'https://deepmind.google/blog/rss.xml' },
+  { name: 'NVIDIA 官方', track: 'AI/LLM', url: 'https://blogs.nvidia.com/feed/' },
+  { name: 'Hugging Face', track: 'AI/LLM', url: 'https://huggingface.co/blog/feed.xml' },
+  { name: 'Microsoft Research', track: 'AI/LLM', url: 'https://www.microsoft.com/en-us/research/feed/' },
+  // Anthropic 沒有 RSS，改抓 /news 列表頁，見 SCRAPERS
+  // —— 社群一手 ——
+  { name: 'r/LocalLLaMA', track: 'AI/LLM', url: 'https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week' },
   { name: 'Simon Willison', track: 'AI/LLM', url: 'https://simonwillison.net/atom/everything/' },
-  // —— AI 趨勢觀點：有論點的人寫的長文，不是「誰又出了什麼功能」——
-  // 官方 blog＋工程平台的公告本質上都是產品介紹，畫面上疊起來就是一排單一工具的新功能；
-  // 這一組補的是「這些東西合起來代表什麼」：產業分析、方法論、反方意見。
-  // 都是週更甚至月更的長文，兩天窗口會長期掛零，一律 7 天。
-  // 打分時看的是論點有沒有新意（見 SCORE_PROMPT），名額另外保底（見 TRACK_QUOTA），
-  // 不然它們的「分享價值」會被 OpenAI 發新模型那種硬新聞壓下去。
-  { name: 'Stratechery', track: 'AI 趨勢觀點', url: 'https://stratechery.com/feed/', maxAgeDays: 7 },
-  { name: 'Import AI', track: 'AI 趨勢觀點', url: 'https://importai.substack.com/feed', maxAgeDays: 7 },
-  { name: 'One Useful Thing', track: 'AI 趨勢觀點', url: 'https://www.oneusefulthing.org/feed', maxAgeDays: 7 },
-  { name: 'Interconnects', track: 'AI 趨勢觀點', url: 'https://www.interconnects.ai/feed', maxAgeDays: 7 },
-  { name: 'Ahead of AI', track: 'AI 趨勢觀點', url: 'https://magazine.sebastianraschka.com/feed', maxAgeDays: 7 },
-  { name: 'Understanding AI', track: 'AI 趨勢觀點', url: 'https://www.understandingai.org/feed', maxAgeDays: 7 },
-  { name: 'Exponential View', track: 'AI 趨勢觀點', url: 'https://www.exponentialview.co/feed', maxAgeDays: 7 },
-  { name: 'Benedict Evans', track: 'AI 趨勢觀點', url: 'https://www.ben-evans.com/benedictevans?format=rss', maxAgeDays: 7 },
-  { name: 'SemiAnalysis', track: 'AI 趨勢觀點', url: 'https://newsletter.semianalysis.com/feed', maxAgeDays: 7 },
-  { name: 'Pragmatic Engineer', track: 'AI 趨勢觀點', url: 'https://newsletter.pragmaticengineer.com/feed', maxAgeDays: 7 },
-  { name: 'Latent Space', track: 'AI 趨勢觀點', url: 'https://www.latent.space/feed', maxAgeDays: 7 },
-  { name: 'Platformer', track: 'AI 趨勢觀點', url: 'https://www.platformer.news/rss/', maxAgeDays: 7 },
-  { name: 'MIT Tech Review AI', track: 'AI 趨勢觀點', url: 'https://www.technologyreview.com/topic/artificial-intelligence/feed', maxAgeDays: 7 },
-  { name: 'Sam Altman', track: 'AI 趨勢觀點', url: 'https://blog.samaltman.com/posts.atom', maxAgeDays: 7 },
-  // 反方：整組都是看多 AI 的人，沒有唱衰的聲音就寫不出「觸發討論」那種草稿
-  { name: 'Gary Marcus', track: 'AI 趨勢觀點', url: 'https://garymarcus.substack.com/feed', maxAgeDays: 7 },
-  { name: 'AI Snake Oil', track: 'AI 趨勢觀點', url: 'https://www.aisnakeoil.com/feed', maxAgeDays: 7 },
-  { name: "Where's Your Ed At", track: 'AI 趨勢觀點', url: 'https://www.wheresyoured.at/rss/', maxAgeDays: 7 },
-  { name: 'Don\'t Worry About the Vase', track: 'AI 趨勢觀點', url: 'https://thezvi.substack.com/feed', maxAgeDays: 7 },
-  // 實測 2026-09-17 沒接的：a16z（/feed/ 404）、The Batch（/the-batch/feed/ 404）、Epoch AI（無 RSS）、
-  // every.to（feed 是空的）、曼報（manny-li.com 403、substack 空）。
-  // 沒接 Lenny's：內容是產品／成長，AI 只是順帶，接了會被打低分白吃名額。
-  // —— 國際科技媒體：中文媒體的上游，直接接原文，不要等人翻 ——
+  // —— 觀點：只留幾個大的。它們很少自己帶出新話題，但會跟著熱門話題寫，算進「多少地方在講」——
+  // 2026-09-17 加的 18 條觀點 newsletter 砍掉大半：保底 6 個名額讓畫面塞滿冷門長文（SemiAnalysis 的 DRAM offloading），
+  // 被使用者嫌「全部都不是我要的」。
+  { name: 'Stratechery', track: 'AI 趨勢觀點', url: 'https://stratechery.com/feed/' },
+  { name: 'Latent Space', track: 'AI 趨勢觀點', url: 'https://www.latent.space/feed' },
+  { name: 'Interconnects', track: 'AI 趨勢觀點', url: 'https://www.interconnects.ai/feed' },
+  { name: 'One Useful Thing', track: 'AI 趨勢觀點', url: 'https://www.oneusefulthing.org/feed' },
+  { name: 'Gary Marcus', track: 'AI 趨勢觀點', url: 'https://garymarcus.substack.com/feed' },
+  { name: 'MIT Tech Review AI', track: 'AI 趨勢觀點', url: 'https://www.technologyreview.com/topic/artificial-intelligence/feed' },
+  // —— 國際科技媒體 ——
   { name: 'TechCrunch', track: '國際科技', url: 'https://techcrunch.com/feed/' },
   { name: 'The Verge', track: '國際科技', url: 'https://www.theverge.com/rss/index.xml' },
   { name: 'Ars Technica', track: '國際科技', url: 'https://feeds.arstechnica.com/arstechnica/index' },
-  { name: 'Apple Newsroom', track: '國際科技', url: 'https://www.apple.com/newsroom/rss-feed.rss', maxAgeDays: 7 },
-  // Lobsters 熱門文章改走 fetchLobstersHot（分數排序、14 天視窗，原「文章靈感」分頁的抓法），
-  // 不要在這裡疊一條 lobste.rs/rss（時間排序、2 天視窗）——同一個站兩種抓法會重複打、還互搶名額。
-  // —— 工程／開發一手：平台自己公告的變更。對接案的人來說「工具變了」比新聞更有用 ——
-  { name: 'n8n 官方', track: '工程/開發', url: 'https://blog.n8n.io/rss/', maxAgeDays: 7 },
-  { name: 'GitHub Blog', track: '工程/開發', url: 'https://github.blog/feed/', maxAgeDays: 7 },
+  // —— 工程／開發：平台跟進某個熱門模型（例：Vercel、Cloudflare 接上 Jev）本身就是熱度的一部分 ——
+  { name: 'n8n 官方', track: '工程/開發', url: 'https://blog.n8n.io/rss/' },
   { name: 'GitHub 變更日誌', track: '工程/開發', url: 'https://github.blog/changelog/feed/' },
-  { name: 'Cloudflare', track: '工程/開發', url: 'https://blog.cloudflare.com/rss/', maxAgeDays: 7 },
+  { name: 'Cloudflare', track: '工程/開發', url: 'https://blog.cloudflare.com/rss/' },
   { name: 'Vercel', track: '工程/開發', url: 'https://vercel.com/atom' },
-  { name: 'Docker', track: '工程/開發', url: 'https://www.docker.com/blog/feed/', maxAgeDays: 7 },
-  { name: 'Supabase', track: '工程/開發', url: 'https://supabase.com/rss.xml', maxAgeDays: 7 },
-  // —— 中文一手：通訊社自家採訪、政府自己公告，中間沒有翻譯層 ——
-  { name: '中央社科技', track: '台灣科技', url: 'https://feeds.feedburner.com/rsscna/technology', maxAgeDays: 3 },
-  { name: 'iThome', track: '台灣科技', url: 'https://www.ithome.com.tw/rss' }, // 自家記者採訪台灣企業 IT／資安，不是編譯外電
-  // 政府一手：更新以月計，兩天窗口會全部濾光；評分改用「有沒有可申請的東西」那把尺
-  { name: '國科會公告', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/news', minScore: 5, maxAgeDays: 7 },
-  { name: '國科會新聞', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/newsdata', minScore: 5, maxAgeDays: 7 },
-  { name: '產業發展署', track: '政府一手', url: 'https://www.ida.gov.tw/ctlr?PRO=rss.RSSView&t=1', minScore: 5, maxAgeDays: 7 },
-  // 沒接美通社（PR Newswire Asia）：確實是「企業自己發稿」的一手，
-  // 但 1-1／1-2／1-3 三個頻道實測全是簡體的中國企業公關稿，對台灣讀者是錯的那種一手。
-  // 沒接 arXiv：近 7 天 261 則，但那是論文摘要不是可轉發的新聞，接了只會把名額洗掉。
+  // —— 台灣中文 ——
+  { name: '中央社科技', track: '台灣科技', url: 'https://feeds.feedburner.com/rsscna/technology' },
+  { name: 'iThome', track: '台灣科技', url: 'https://www.ithome.com.tw/rss' },
+  // 政府公告不在這裡，見 GOV_FEEDS
 ]
+
+// 政府公告另外一條線，不走熱度：補助、徵件重要的是「能不能申請、什麼時候截止」，不是多少人在聊，
+// 放進熱度排序永遠排不上來（2026-09-23 改版時一度整組拿掉，被使用者糾正「有些很重要」）。
+// 這條線只收「有明確申請對象、補助金額或截止日」的，照截止日排；得獎名單、活動花絮、首長行程一律不收
+// （舊版的「總統盃無人機競賽 152 隊」被打 8 分混進板上，就是沒守住這條）。
+const GOV_FEEDS: Feed[] = [
+  { name: '國科會公告', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/news' },
+  { name: '國科會新聞', track: '政府一手', url: 'https://www.nstc.gov.tw/nstc/rss/newsdata' },
+  { name: '產業發展署', track: '政府一手', url: 'https://www.ida.gov.tw/ctlr?PRO=rss.RSSView&t=1' },
+]
+const GOV_MAX_AGE_DAYS = 14 // 公告一個月才幾則，7 天常常整條是空的；截止日才是真正的時效
+const GOV_MIN_SCORE = 7
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
@@ -149,72 +133,23 @@ async function resolveGoogleNews(url: string): Promise<string> {
   }
 }
 
-const PER_FEED = 4
-const HN_LIMIT = 6
-// 兩段各有自己的上限：打分用 8B 很便宜，可以多看一點；寫草稿的 70B 才是花錢的地方。
-// 以前共用一個 8 的上限，等於「排在前面的來源先填滿就結束」——HN 4 則＋OpenAI 4 則剛好吃光，
-// 中文來源永遠輪不到，所以抓回來的全是英文。
-// SCAN_CAP 跟來源數綁在一起：來源輪流取，名額比來源數少太多就等於一半的來源分不到任何一則。
-// 加了 18 條趨勢觀點來源之後從 64 開到 96（51 條來源 × 約 2 則），打分批數 8 → 12，8B 模型撐得住。
-const SCAN_CAP = 96 // 進第一階段打分的則數
-// 進第二階段寫摘要的則數。草稿移到前端點了才生之後，這段從 1800 token 縮到 500，
-// 同樣的錢可以多看兩倍——所以名額從 8（閃 Groq 免費額度的舊值）開到 20。
-const WRITE_CAP = 20
-// 第一階段同時打幾批。Groq 的 TPM 是滾動視窗，一次噴 4 批（約 1 萬 token）容易撞上限；
-// 開 2 批是把同樣的量攤平在幾秒內送完，整輪只慢幾秒。
-const SCORE_CONCURRENCY = 2
-const REWRITE_CONCURRENCY = 6 // 第二階段（寫摘要）同時幾則：20 則分四輪打完
-const MIN_SCORE = 6
-// 各分類在 WRITE_CAP 裡的保底／封頂（過門檻的才算，過不了門檻保底也不會硬塞）。
-// 沒列的分類保底 1、不封頂。用法見 fetchNewsCandidates 挑 worthy 那段。
-const TRACK_QUOTA: Record<string, { min?: number; max?: number }> = {
-  'AI 趨勢觀點': { min: 6 },
-  '工程/開發': { max: 4 },
-}
+// 一條來源最多收幾則。以前是 4：iThome 一天發十幾篇，它 9/18 那篇 Jev 報導早就被擠出前 4 則。
+const PER_FEED = 12
+const WRITE_CAP = 12 // 寫摘要的話題數（照熱度取前幾名）
+const REWRITE_CONCURRENCY = 6
 
-// 兩階段的省錢邏輯不在「換小模型」，而在「量」：
-// 第一階段一則只產出編號＋分數（約 30 token），第二階段才寫摘要＋3 草稿（1800 token），
-// 而且只有 WRITE_CAP 則走得到第二階段。模型統一交給 lib/llm-json 決定（OPENROUTER_MODEL 可覆寫）。
+// 第二階段寫摘要＋判斷適不適合改寫成文章。輸入是一整個話題（多篇文章的標題），不是單篇。
+const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一個最近很紅的 AI 話題，附上講這件事的幾篇文章標題與摘要。回傳一個 JSON 物件，鍵必須剛好是 中文標題、摘要、適合改寫、改寫建議。
 
-// 打分要整批送，不能一則一次。來源開到 33 條之後 SCAN_CAP 是 64（現在 51 條、96 則），
-// 一則一次呼叫就是 64 次請求，實測直接撞每分鐘上限（429）。整批送只要 8 次（現在 12 次）。
-// 順帶好處：模型看得到同一批的其他則，有比較基準，分數才拉得開——
-// 一則一則問的時候沒有基準，實測會整批都給 8 分，MIN_SCORE 等於沒作用。
-const SCORE_BATCH = 8
+中文標題：一句繁體中文標題，25 字內，講清楚發生什麼事，保留英文專有名詞。
 
-const SCORE_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編。我會給你一批科技新聞，每則有編號。請判斷每則對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值。
+摘要：用繁體中文 200 到 300 字說明這個話題，先講發生了什麼事、再補重點細節與背景、最後帶為什麼大家在討論，分 2 到 3 段寫清楚來龍去脈，讓人不點原文也能完整看懂。
+多篇文章講的是同一件事的不同面向（發表、評測、複製版、反方意見）時，要把這些面向串起來講，不要只摘其中一篇。
+不可以只把標題換句話說；材料不夠時用你對這個領域的常識補背景，但不可以編造數字、日期或引述。
 
-分數是 0 到 10 的整數：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。
-同一批裡分數必須拉開，不可以全部給一樣的分數；如果整批都很普通，就照相對高低給 3 到 6。
+適合改寫：布林值。有明確論點、方法論、爭議、或能延伸出台灣場景對比、實戰案例這類討論空間的給 true；純人事、募資、財報這種沒觀點好切的給 false。
 
-單一工具的功能介紹要壓低：「某產品推出某功能」「某版本發布」「某平台新增整合」這類只有用那個工具的人才在乎的，給 3 到 5；
-只有改變整個領域格局的發布（新一代模型、價格砍半、開源了原本閉源的東西）才給 7 以上。
-反過來，有趨勢判斷、產業分析、方法論、或明確反方意見的文章，就算不是「今天發生的事」也給 7 以上——讀者要的是看法，不是產品目錄。
-
-兩個特例，看我給的「分類」欄：
-分類是「政府一手」時，這是公告不是新聞，不要用話題性評。有明確申請對象、補助金額或截止日的補助／徵件／計畫徵求給 7 分以上；純徵才職缺、內部行政、得獎名單、活動花絮給 2 分。
-分類是「AI 趨勢觀點」時，評的是論點：有新的判斷、能引發討論、跟台灣接案或工程現場對得上的給 7 以上；每週例行的新聞彙整、podcast 預告、只重述別人新聞的給 4 以下。
-
-回傳 JSON：{"結果":[{"編號":1,"分數":8}]}
-每一則都要回，編號要跟我給的一致，不可省略或合併。不要寫任何理由。只回 JSON。`
-
-// 第二階段寫摘要＋判斷適不適合改寫成文章（原「文章靈感」分頁的 worth 判斷併過來，同一則新聞不用問兩次 AI）。
-// 草稿改成前端點了才呼叫 /api/news/draft，這裡的預算才擠得出「改寫建議」這個新欄位。
-const SUMMARY_PROMPT = `你是 Q kangber（n8n 自動化接案 + AI 應用實踐者）的新聞小編，同時也幫他過濾哪些新聞值得另外寫成中文部落格長文。我會給你一則科技新聞，請做兩件事：判斷它對「對自動化、AI、工程有興趣的台灣讀者」有沒有分享價值並寫摘要；再判斷它適不適合改寫成長文。回傳一個 JSON 物件，鍵必須剛好是 分數、摘要、適合改寫、改寫建議。
-
-分數是 0 到 10 的整數，代表這則新聞的分享價值：重要、跟 AI 或自動化或工程相關、讀者會想知道的給高分；公關稿、業配、重複、無關的給低分。
-單一工具的功能介紹（某產品推出某功能、某版本發布）只有用那個工具的人才在乎，給 3 到 5；改變整個領域格局的發布才給 7 以上。有趨勢判斷、產業分析、方法論或反方意見的文章給 7 以上。
-特例：分類是「政府一手」時這是公告不是新聞，有明確申請對象、補助金額或截止日的給 7 分以上；純徵才、內部行政、得獎名單給 2 分。
-分類是「AI 趨勢觀點」時評的是論點：有新判斷、能引發討論的給 7 以上；例行新聞彙整、podcast 預告給 4 以下。
-
-摘要：用繁體中文 200 到 300 字說明這則新聞，先講發生了什麼事、再補重點細節與背景、最後帶為什麼值得關注，分 2 到 3 段寫清楚來龍去脈，讓人不點原文也能完整看懂（英文新聞也要翻成中文摘要）。
-分類是「政府一手」時，摘要要寫清楚「誰可以申請、什麼時候截止、給多少」，這比背景重要。
-分類是「AI 趨勢觀點」時，摘要要寫清楚「作者的論點是什麼、憑什麼這樣說、跟主流看法差在哪」，不要寫成事件報導。
-不可以只把標題換句話說；我給的原始摘要很短甚至空白時，就用你對這個領域的常識補背景，但不可以編造數字、日期或引述。
-
-適合改寫：布林值。純技術新聞（新版本發布、公司併購、募資新聞、公告）沒有觀點好切，給 false；有明確論點、方法論、或作者踩坑心得，能延伸出台灣場景對比、反方論點、實戰案例這類討論空間的，才給 true。分類是「政府一手」時一律 false。
-
-改寫建議：一句完整的話（25 到 45 字）。適合改寫是 true 時，具體指名可以切的角度（哪個台灣場景對比、延伸哪個反方論點、補一個原文沒講的案例），不能寫「可以結合在地案例探討」這種誰套都成立的空話；適合改寫是 false 時給空字串。
+改寫建議：一句完整的話（25 到 45 字）。適合改寫是 true 時，具體指名可以切的角度（哪個台灣場景對比、延伸哪個反方論點、對 n8n 自動化接案有什麼影響），不能寫「可以結合在地案例探討」這種誰套都成立的空話；適合改寫是 false 時給空字串。
 
 只回 JSON。`
 
@@ -228,143 +163,48 @@ function strip(s: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/&#8217;/g, '’')
+    .replace(/&#8216;/g, '‘')
     .replace(/\s+/g, ' ')
     .trim()
 }
 
-// 門檻＝這則要拿幾分才過稿（來源自己的尺，沒指定就用全域 MIN_SCORE）
-type Parsed = {
-  標題: string
-  原文連結: string
-  來源: string
-  類型: string
-  摘要: string
-  圖片連結: string
-  發布時間: string
-  門檻?: number
-}
+type Parsed = Article & { 類型: string; 圖片連結: string }
 
-// Hacker News：抓首頁（已被票選過、品質高、又快），給的是原文乾淨連結
+// Hacker News：10 天內 100 分以上的文章，照分數取前 100。
+// 以前只抓「當下首頁前 6 名」：Jev 發表文 1970 分，但一週後早就不在首頁；
+// 首頁第 4、5 名的 Enigma（612 分）、五角大廈（535 分）又被來源輪流取砍掉。
+// 這裡不過濾主題，非 AI 的交給併話題那一步丟掉。
+const HN_DAYS = 10
 async function fetchHackerNews(): Promise<Parsed[]> {
   try {
-    const res = await fetch('https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30', {
-      cache: 'no-store',
-      headers: { 'User-Agent': UA },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    })
+    const since = Math.floor((Date.now() - HN_DAYS * 86400_000) / 1000)
+    const res = await fetch(
+      `https://hn.algolia.com/api/v1/search?tags=story&hitsPerPage=100&numericFilters=created_at_i>${since},points>100`,
+      { cache: 'no-store', headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) }
+    )
     if (!res.ok) return []
     const data = (await res.json()) as {
-      hits?: Array<{ title?: string; url?: string; points?: number; created_at?: string }>
+      hits?: Array<{ objectID: string; title?: string; url?: string; points?: number; created_at?: string; story_text?: string | null }>
     }
     return (data.hits || [])
-      .filter((h) => h.url && h.title)
-      .sort((a, b) => (b.points || 0) - (a.points || 0))
-      .slice(0, HN_LIMIT)
+      .filter((h) => h.title)
       .map((h) => ({
         標題: h.title!,
-        原文連結: h.url!,
+        原文連結: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
         來源: 'Hacker News',
         類型: '國際科技',
-        摘要: '',
-        圖片連結: '',
-        發布時間: h.created_at || '',
-      }))
-  } catch {
-    return []
-  }
-}
-
-// 原「文章靈感」分頁的兩個來源併過來：首頁排序看熱度不看主題，AI 趨勢文常常擠不進 fetchHackerNews 的前 6 則，
-// 這裡直接用關鍵字搜尋、分開查每個關鍵字再合併去重（混著查會被熱門詞「AI」稀釋掉冷門但精準的詞「vibe coding」）。
-const AI_KEYWORDS = ['vibe coding', 'AI agent', 'LLM', 'AI coding', 'coding agent']
-const AI_LIMIT_PER_KEYWORD = 5
-const AI_TOTAL_LIMIT = 16
-const AI_MAX_AGE_DAYS = HARD_MAX_AGE_DAYS // 這是討論熱度不是發布時間，用一般新聞的 2 天窗口會直接濾光，但也不放寬到天花板以外
-
-async function fetchAITrending(): Promise<Parsed[]> {
-  const minCreatedAt = Math.floor((Date.now() - AI_MAX_AGE_DAYS * 24 * 3600 * 1000) / 1000)
-  const results = await Promise.all(
-    AI_KEYWORDS.map(async (keyword) => {
-      const params = new URLSearchParams()
-      params.set('query', keyword)
-      params.set('tags', 'story')
-      params.set('hitsPerPage', String(AI_LIMIT_PER_KEYWORD))
-      params.set('numericFilters', `created_at_i>${minCreatedAt},points>=10`)
-      try {
-        const res = await fetch(`https://hn.algolia.com/api/v1/search?${params.toString()}`, {
-          cache: 'no-store',
-          headers: { 'User-Agent': UA },
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        })
-        if (!res.ok) return [] as Array<{ objectID: string; title?: string; url?: string | null; created_at?: string; story_text?: string | null }>
-        const json = await res.json()
-        return (json.hits ?? []) as Array<{ objectID: string; title?: string; url?: string | null; created_at?: string; story_text?: string | null }>
-      } catch {
-        return []
-      }
-    })
-  )
-  const seen = new Set<string>()
-  const out: Parsed[] = []
-  for (const hits of results) {
-    for (const h of hits) {
-      if (!h.title || seen.has(h.objectID)) continue
-      seen.add(h.objectID)
-      out.push({
-        標題: h.title,
-        原文連結: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
-        來源: 'HN AI關鍵字',
-        類型: 'AI/LLM',
         摘要: cleanStoryText(h.story_text),
         圖片連結: '',
         發布時間: h.created_at || '',
-      })
-    }
-  }
-  return out.slice(0, AI_TOTAL_LIMIT)
-}
-
-const LOBSTERS_AI_LIMIT = 10
-const LOBSTERS_HOT_LIMIT = 12
-
-// 原「文章靈感」分頁的第三個來源：hottest 榜是分數排序，跟 lobste.rs/rss 的時間排序不同，
-// 撈的是「還在被討論」的文章，不是「剛發的」；視窗跟著 AI tag 一樣放寬到 14 天。
-async function fetchLobstersHot(): Promise<Parsed[]> {
-  try {
-    const res = await fetch('https://lobste.rs/hottest.json', {
-      cache: 'no-store',
-      headers: { 'User-Agent': UA },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    })
-    if (!res.ok) return []
-    const hits = (await res.json()) as Array<{
-      short_id: string
-      title: string
-      url?: string
-      score: number
-      created_at: string
-      description_plain?: string
-      comments_url: string
-    }>
-    return hits
-      .filter((h) => Date.now() - new Date(h.created_at).getTime() < AI_MAX_AGE_DAYS * 24 * 3600 * 1000)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, LOBSTERS_HOT_LIMIT)
-      .map((h) => ({
-        標題: h.title,
-        原文連結: h.url || h.comments_url,
-        來源: 'Lobsters',
-        類型: '國際科技',
-        摘要: strip(h.description_plain || '').slice(0, 600),
-        圖片連結: '',
-        發布時間: h.created_at,
+        點數: h.points || 0,
       }))
   } catch {
     return []
   }
 }
 
-// Lobsters hottest 榜跟 HN 首頁一樣看熱度不看主題，AI 文章常常上不了榜，直接吃 ai/ml tag 的 feed。
+// Lobsters AI tag：HN 以外的工程圈討論。熱門榜（hottest）不分主題，併話題時也會被丟掉大半，就不抓了。
 async function fetchLobstersAI(): Promise<Parsed[]> {
   try {
     const res = await fetch('https://lobste.rs/t/ai,ml.json', {
@@ -374,7 +214,6 @@ async function fetchLobstersAI(): Promise<Parsed[]> {
     })
     if (!res.ok) return []
     const hits = (await res.json()) as Array<{
-      short_id: string
       title: string
       url?: string
       score: number
@@ -382,19 +221,15 @@ async function fetchLobstersAI(): Promise<Parsed[]> {
       description_plain?: string
       comments_url: string
     }>
-    return hits
-      .filter((h) => Date.now() - new Date(h.created_at).getTime() < AI_MAX_AGE_DAYS * 24 * 3600 * 1000)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, LOBSTERS_AI_LIMIT)
-      .map((h) => ({
-        標題: h.title,
-        原文連結: h.url || h.comments_url,
-        來源: 'Lobsters AI tag',
-        類型: 'AI/LLM',
-        摘要: strip(h.description_plain || '').slice(0, 600),
-        圖片連結: '',
-        發布時間: h.created_at,
-      }))
+    return hits.slice(0, 20).map((h) => ({
+      標題: h.title,
+      原文連結: h.url || h.comments_url,
+      來源: 'Lobsters',
+      類型: 'AI/LLM',
+      摘要: strip(h.description_plain || '').slice(0, 600),
+      圖片連結: '',
+      發布時間: h.created_at,
+    }))
   } catch {
     return []
   }
@@ -404,7 +239,7 @@ function parseFeed(xml: string, feed: Feed): Parsed[] {
   const blocks = xml.match(/<item[\s\S]*?<\/item>/gi) || xml.match(/<entry[\s\S]*?<\/entry>/gi) || []
   const out: Parsed[] = []
   for (const b of blocks) {
-    if (out.length >= PER_FEED) break
+    if (out.length >= (feed.max ?? PER_FEED)) break
     const tM = b.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
     let link = ''
     const lAtom = b.match(/<link[^>]*href="([^"]+)"/i)
@@ -441,53 +276,57 @@ function parseFeed(xml: string, feed: Feed): Parsed[] {
       摘要: strip(descM ? descM[1] : '').slice(0, 600),
       圖片連結: img,
       發布時間: dM ? strip(dM[1]) : '',
-      門檻: feed.minScore,
     })
   }
   return out
 }
 
-// 沒有 RSS 的網站：直接讀列表頁 HTML。
-// 版型好幾年不動，但仍然是會壞的東西——任何一支 parse 掛掉都只讓那條回 0 則，
-// 並在抓取報告的「狀態」欄現形，不會拖垮整輪。
+// 沒有 RSS 的網站：直接讀列表頁 HTML。任何一支 parse 掛掉都只讓那條回 0 則，並在報告的「狀態」欄現形。
 type Scraper = Feed & { parse: (html: string, s: Scraper) => Parsed[] }
 
-// Anthropic /news：每張卡是 <a href="/news/slug">，裡面有 <time>Jul 9, 2026</time>、
-// 標題在 <h2>~<h4>（首篇跟側欄的順序不同，所以在整塊裡各找各的，不靠先後）、摘要在 <p class="body-3 serif">。
-// 首篇會同時出現在 featured 與下方列表，靠 fetchNewsCandidates 的 seen（比原文連結）去重。
+// Anthropic /news：每張卡是一個 <a href>，裡面有 <time>Sep 22, 2026</time>。
+// 舊版只認 <a href="/news/…">＋<h*> 標題，結果兩種卡都漏（實測 2026-09-23 只抓到 8 月的舊文，Opus 5.5 公告整篇沒抓到）：
+//   精選卡的連結是 /claude-opus-5-5 或完整網址，不在 /news/ 底下
+//   列表卡的標題是 <span class="…title…">，不是 <h*>
+// 所以改成：任何含 <time> 的 <a>，標題依序找 <h*>、class 含 title 的 span。
 function parseAnthropic(html: string, s: Scraper): Parsed[] {
   const out: Parsed[] = []
-  for (const raw of html.split('<a href="/news/').slice(1)) {
+  const seen = new Set<string>()
+  for (const raw of html.split('<a href="').slice(1)) {
     if (out.length >= PER_FEED) break
-    const slug = raw.match(/^([a-z0-9-]+)"/)
-    if (!slug) continue
+    const href = raw.match(/^((?:https:\/\/www\.anthropic\.com)?\/[a-z0-9/-]+)"/)
+    if (!href) continue
     const end = raw.indexOf('</a>')
     const b = end === -1 ? raw.slice(0, 4000) : raw.slice(0, end)
-    const t = b.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/)
-    if (!t) continue
     const d = b.match(/<time[^>]*>([^<]+)<\/time>/)
-    const p = b.match(/<p[^>]*class="body-3[^"]*"[^>]*>([\s\S]*?)<\/p>/)
+    if (!d) continue
+    const t = b.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/) || b.match(/<span[^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/span>/)
+    if (!t) continue
+    const url = href[1].startsWith('http') ? href[1] : `https://www.anthropic.com${href[1]}`
+    if (seen.has(url)) continue
+    seen.add(url)
+    const p = b.match(/<p[^>]*>([\s\S]*?)<\/p>/)
     out.push({
       標題: strip(t[1]),
-      原文連結: `https://www.anthropic.com/news/${slug[1]}`,
+      原文連結: url,
       來源: s.name,
       類型: s.track,
       摘要: strip(p ? p[1] : ''),
       圖片連結: '',
-      發布時間: d ? strip(d[1]) : '',
-      門檻: s.minScore,
+      發布時間: strip(d[1]),
     })
   }
   return out
 }
 
-// 數位發展部新聞稿：每則一個 <li class="list-group-item">，
-// 標題在 <a title="移至…">、日期在 <div class="listDate">YYYY-MM-DD</div>
+// 數位發展部新聞稿：每則一個 <li class="list-group-item …">，
+// 標題在 <a title="移至…">、日期在 <div class="listDate …">YYYY-MM-DD</div>。
+// 2026-09 前後網址從 /press/press-releases/20684.html 改成沒有 .html，舊的正則因此整條解不到。
 function parseModa(html: string, s: Scraper): Parsed[] {
   const out: Parsed[] = []
   for (const b of html.split('<li class="list-group-item').slice(1)) {
     if (out.length >= PER_FEED) break
-    const a = b.match(/href="(\/press\/press-releases\/\d+\.html)"[^>]*title="(?:移至)?([^"]*)"/)
+    const a = b.match(/href="(\/press\/press-releases\/\d+(?:\.html)?)"[^>]*title="(?:移至)?([^"]*)"/)
     if (!a) continue
     const d = b.match(/class="listDate[^"]*"[^>]*>\s*([\d-]+)/)
     out.push({
@@ -498,102 +337,30 @@ function parseModa(html: string, s: Scraper): Parsed[] {
       摘要: '',
       圖片連結: '',
       發布時間: d ? d[1].trim() : '',
-      門檻: s.minScore,
     })
   }
   return out
 }
 
 const SCRAPERS: Scraper[] = [
-  { name: 'Anthropic 官方', track: 'AI/LLM', url: 'https://www.anthropic.com/news', maxAgeDays: 7, parse: parseAnthropic },
-  {
-    name: '數位發展部',
-    track: '政府一手',
-    url: 'https://moda.gov.tw/press/press-releases/372.html',
-    minScore: 5,
-    maxAgeDays: 7,
-    parse: parseModa,
-  },
-  // 沒接教育部青年發展署：實測兩輪都是收下 4 則、過稿 0 則。
-  // 它的公告是壯遊點、志工行動、職涯競賽，不是 AI 或科技，評分每次都正確地刷掉，純粹在吃名額。
-  // 青年相關的 AI 補助實際上在國科會與數發部，這兩條已經在跑。
+  { name: 'Anthropic 官方', track: 'AI/LLM', url: 'https://www.anthropic.com/news', parse: parseAnthropic },
+]
+const GOV_SCRAPERS: Scraper[] = [
+  { name: '數位發展部', track: '政府一手', url: 'https://moda.gov.tw/press/press-releases/372.html', parse: parseModa },
 ]
 
-// 標題相似度去重：同一則事件被不同媒體報導時只留一則
-function titleGrams(t: string): Set<string> {
-  const clean = t.split(' - ')[0].replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase()
-  const grams = new Set<string>()
-  for (let i = 0; i < clean.length - 1; i++) grams.add(clean.slice(i, i + 2))
-  return grams
-}
-function jaccard(a: Set<string>, b: Set<string>): number {
-  if (!a.size || !b.size) return 0
-  let inter = 0
-  for (const g of a) if (b.has(g)) inter++
-  return inter / (a.size + b.size - inter)
-}
-// 抓標題裡的英文專有名詞（Anthropic、Meta、Homebrew…），用來判斷同一主角
-const NOUN_STOP = new Set(['news', 'http', 'https', 'www', 'com', 'html', 'yahoo', 'google'])
-function properNouns(t: string): Set<string> {
-  const head = t.split(' - ')[0]
-  const out = new Set<string>()
-  for (const m of head.matchAll(/[A-Za-z][A-Za-z0-9]{3,}/g)) {
-    const w = m[0].toLowerCase()
-    if (!NOUN_STOP.has(w)) out.add(w)
-  }
-  return out
-}
-// 要共用兩個以上專有名詞才算同一則。只共用一個詞就殺太狠：
-// 「Gemini 延後、Pichai 捍衛 Google AI」跟「Alphabet 公布 Q2 財報」只因為都有 Gemini 就被當重複，
-// 中文標題英文詞本來就少，這條誤殺的幾乎都是中文則。單一共用詞的情況交給 jaccard 把關。
-function shareNoun(a: Set<string>, b: Set<string>): boolean {
-  let n = 0
-  for (const w of a) if (b.has(w) && ++n >= 2) return true
-  return false
+// 話題的代表連結：先挑發布者自己講的（官方），再挑媒體原文，最後才是社群討論串。
+// HN 的連結本來就是原文網址，所以 HN 那則也可以當代表，只是排在媒體後面。
+const COMMUNITY = new Set(['Hacker News', 'Lobsters', 'r/LocalLLaMA', 'The Rundown AI', 'Google News AI'])
+function representative(t: Topic): Parsed {
+  const arts = t.文章 as Parsed[]
+  const rank = (a: Parsed) => (a.來源.includes('官方') ? 0 : COMMUNITY.has(a.來源) ? 2 : 1)
+  return [...arts].sort((a, b) => rank(a) - rank(b) || (b.點數 ?? 0) - (a.點數 ?? 0) || (b.圖片連結 ? 1 : 0) - (a.圖片連結 ? 1 : 0))[0]
 }
 
-// 依來源輪流取，別讓排在前面的來源把名額吃光（HN 和 OpenAI 各 4 則就填滿舊的 8 格上限）
-function interleaveBySource(items: Parsed[]): Parsed[] {
-  const groups = new Map<string, Parsed[]>()
-  for (const it of items) {
-    const g = groups.get(it.來源)
-    if (g) g.push(it)
-    else groups.set(it.來源, [it])
-  }
-  const lists = [...groups.values()]
-  const out: Parsed[] = []
-  for (let round = 0; out.length < items.length; round++) {
-    let moved = false
-    for (const l of lists) {
-      if (round < l.length) {
-        out.push(l[round])
-        moved = true
-      }
-    }
-    if (!moved) break
-  }
-  return out
-}
-function dedupeByTitle(items: Parsed[]): Parsed[] {
-  const kept: Parsed[] = []
-  const grams: Set<string>[] = []
-  const nouns: Set<string>[] = []
-  for (const it of items) {
-    const g = titleGrams(it.標題)
-    const n = properNouns(it.標題)
-    const dup = grams.some((k, idx) => jaccard(g, k) > 0.45 || (n.size > 0 && shareNoun(n, nouns[idx])))
-    if (dup) continue
-    grams.push(g)
-    nouns.push(n)
-    kept.push(it)
-  }
-  return kept
-}
-
-type Summary = { 分數: number; 摘要: string; 適合改寫: boolean; 改寫建議: string }
+type Summary = { 中文標題: string; 摘要: string; 適合改寫: boolean; 改寫建議: string }
 
 // 撞到 token 上限要讓前端講清楚，不能跟「今天沒新聞」長得一樣。
-// 訊息不要寫死是哪一家：實際打的是 OpenRouter 還是 Groq，要看 OPENROUTER_API_KEY 有沒有設。
 export class RateLimitError extends Error {
   constructor(public retryAfter: string) {
     super(`AI 額度暫時用完${retryAfter ? `，約 ${retryAfter} 後恢復` : '，等一下再試'}`)
@@ -604,49 +371,25 @@ export class RateLimitError extends Error {
 function asRateLimit(e: unknown): RateLimitError | null {
   const s = String(e)
   if (!s.includes('429') && !s.includes('rate_limit')) return null
-  // Groq 給的是 "30m22.176s."，去掉句點和毫秒，講成「30m22s」就好；OpenRouter 不一定會給
   const t = (s.match(/try again in ([\dhms.]+)/)?.[1] ?? '').replace(/\.$/, '').replace(/\.\d+s$/, 's')
   return new RateLimitError(t)
 }
 
-// 第一階段：整批只問分數，用小模型、max_tokens 抓很小。
-// 回傳 Map(picked 的索引 → 分數)，模型漏回的那幾則就不在 Map 裡（當作 0 分）。
-async function scoreBatch(batch: Parsed[], offset: number): Promise<Map<number, number>> {
-  const list = batch
-    // 摘要只給 100 字：打分只需要判斷「是什麼題材」，給太多會把 64 則的總 token 推去撞每分鐘上限
-    .map((n, i) => `[${offset + i + 1}] 標題:${n.標題}\n來源:${n.來源}｜分類:${n.類型}\n摘要:${n.摘要.slice(0, 100)}`)
-    .join('\n\n')
-  // 一則只有編號＋分數，30 token 綽綽有餘
-  const raw = await chatJSON(SCORE_PROMPT, list, 30 * batch.length, 0)
-  const out = new Map<number, number>()
-  try {
-    const r = JSON.parse(raw) as {
-      結果?: { 編號?: number; 分數?: number }[]
-    }
-    for (const row of r.結果 ?? []) {
-      const idx = Number(row.編號) - 1
-      // 編號要落在這一批的範圍內，否則是模型自己編的
-      if (!Number.isInteger(idx) || idx < offset || idx >= offset + batch.length) continue
-      out.set(idx, Number(row.分數 ?? 0))
-    }
-  } catch {
-    // 壞 JSON：整批當作沒評到
-  }
-  return out
-}
-
-// 第二階段：只有過門檻的才走到這裡，寫 200-300 字摘要（貼文草稿留給前端點了才生）
-async function summarize(n: Parsed): Promise<Summary | null> {
+export async function summarizeTopic(t: Topic, zh: { 標題: string } | null): Promise<Summary | null> {
+  const lines = t.文章
+    .slice(0, 10)
+    .map((a) => `- ${a.標題}（${a.來源}）${a.摘要 ? `：${a.摘要.slice(0, 200)}` : ''}`)
+    .join('\n')
   const raw = await chatJSON(
     SUMMARY_PROMPT,
-    `標題:${n.標題}\n來源:${n.來源}\n分類:${n.類型}\n摘要:${n.摘要}\n原文連結:${n.原文連結}`,
-    650,
+    `話題:${t.話題}\n相關文章:\n${lines}${zh ? `\n台灣媒體報導標題:${zh.標題}` : ''}`,
+    800,
     0.5
   )
   try {
-    const r = JSON.parse(raw) as { 分數?: number; 摘要?: string; 適合改寫?: boolean; 改寫建議?: string }
+    const r = JSON.parse(raw) as Partial<Summary>
     return {
-      分數: Number(r.分數 ?? 0),
+      中文標題: String(r.中文標題 ?? ''),
       摘要: String(r.摘要 ?? ''),
       適合改寫: Boolean(r.適合改寫),
       改寫建議: String(r.改寫建議 ?? ''),
@@ -656,231 +399,228 @@ async function summarize(n: Parsed): Promise<Summary | null> {
   }
 }
 
-// 預設兩天內才收；政府公告那類用來源自己的窗口，但一律夾在 HARD_MAX_AGE_DAYS 以內。
-// 日期讀不出來的就不收：以前是「當作新的留著」，結果變成沒日期＝不受任何時效限制的後門。
-// 某條來源因此整條掛零時，抓取報告的「收下」欄會是 0，比默默混進舊聞好查。
-function isFresh(發布時間: string, maxAgeDays?: number): boolean {
+function isFresh(發布時間: string): boolean {
   if (!發布時間) return false
   const t = Date.parse(發布時間)
   if (isNaN(t)) return false
-  const days = Math.min(maxAgeDays ?? MAX_AGE_DAYS, HARD_MAX_AGE_DAYS)
-  return Date.now() - t <= days * 24 * 3600 * 1000
+  return Date.now() - t <= MAX_AGE_DAYS * 24 * 3600 * 1000
 }
 
-// 每個階段剩幾則，讓前端能講清楚「為什麼只有這幾則」。
-// 來源從 9 條變 32 條之後，沒有這張表就查不出「某條是抓不到還是被時效濾光」。
 export type FetchReport = {
   抓到: number
-  去重後: number
-  送打分: number
-  低分: number // 打分低於門檻
-  名額外: number // 過了門檻但沒擠進 WRITE_CAP
+  話題: number
   來源: { 名稱: string; 收下: number; 狀態: string }[]
 }
 
-// 回傳：候選（不寫表，前端拿去顯示）＋掃描數＋各階段報告
+async function fetchOne(f: Feed | Scraper) {
+  try {
+    const res = await fetch(f.url, {
+      cache: 'no-store',
+      headers: { 'User-Agent': UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (!res.ok) return { name: f.name, items: [] as Parsed[], 狀態: `HTTP ${res.status}` }
+    const text = await res.text()
+    const items = 'parse' in f ? f.parse(text, f) : parseFeed(text, f)
+    // 抓得到頁面但一則都沒解出來＝版型換了，要講出來，不要當成「今天沒新聞」
+    return { name: f.name, items, 狀態: items.length ? 'ok' : '解不到項目（版型可能已改）' }
+  } catch (e) {
+    return { name: f.name, items: [] as Parsed[], 狀態: `連不上（${String(e).slice(0, 40)}）` }
+  }
+}
+
+// 抓所有來源、依網址去重、只留 7 天內的。scripts/news-eval.ts、scripts/news-push.ts 也用這支。
+export async function collectArticles(): Promise<{ articles: Parsed[]; 來源: FetchReport['來源'] }> {
+  const [hn, lobsters, ...rest] = await Promise.all([
+    fetchHackerNews(),
+    fetchLobstersAI(),
+    ...[...FEEDS, ...SCRAPERS].map(fetchOne),
+  ])
+  const groups = [
+    { name: 'Hacker News', items: hn, 狀態: hn.length ? 'ok' : '抓不到' },
+    { name: 'Lobsters', items: lobsters, 狀態: lobsters.length ? 'ok' : '抓不到' },
+    ...rest,
+  ]
+  const seen = new Set<string>()
+  const articles: Parsed[] = []
+  const 來源: FetchReport['來源'] = []
+  for (const g of groups) {
+    let n = 0
+    for (const p of g.items) {
+      if (seen.has(p.原文連結) || !isFresh(p.發布時間)) continue
+      seen.add(p.原文連結)
+      articles.push(p)
+      n++
+    }
+    來源.push({ 名稱: g.name, 收下: n, 狀態: g.狀態 })
+  }
+  return { articles, 來源 }
+}
+
+// ---------- 政府公告 ----------
+
+const GOV_PROMPT = `你幫 Q kangber（n8n 自動化接案、一人公司、AI 應用實踐者）過濾台灣政府公告。我會給你一批公告標題（每則有編號）。
+判斷每則對他有沒有用：他在找的是「可以申請的東西」——補助、計畫徵求、競賽獎金、培訓名額、採購標案，尤其跟 AI、數位、軟體、新創、中小企業有關的。
+
+分數 0 到 10：
+- 有明確申請對象、補助金額或截止日的補助／徵件／計畫徵求／標案，而且 AI、數位、軟體、新創、中小企業能申請的：8 到 10
+- 同上但對象是學術機構、大企業或其他產業，一人公司基本申請不到的：5 到 6
+- 政策方向、法規變動，會影響 AI 或數位產業但不能申請的：5
+- 核定名單、得獎名單、活動花絮、首長行程、研討會、展覽、內部行政、網路維護公告：0 到 2
+
+每則回：
+- 分數
+- 截止日：公告裡有寫申請截止日就給 YYYY-MM-DD（民國年要換成西元），沒寫就空字串，不可以猜
+- 重點：一句繁體中文（60 字內）講「誰可以申請、給什麼、什麼時候截止」；不能申請的就講這則在說什麼
+
+回傳 JSON：{"結果":[{"編號":1,"分數":8,"截止日":"2026-10-31","重點":"…"}]}
+每一則都要回，編號要一致。只回 JSON。`
+
+// 抓政府公告 → 一次整批請 LLM 評「能不能申請」→ 過門檻的變成候選（照截止日排，沒寫截止日的排後面）。
+// 公告一次才十幾二十則，整批一次呼叫就好，不用像熱門話題那樣另外寫摘要。
+export async function govCandidates(): Promise<{ items: Candidate[]; 來源: FetchReport['來源'] }> {
+  const groups = await Promise.all([...GOV_FEEDS, ...GOV_SCRAPERS].map(fetchOne))
+  const fresh = (p: Parsed) => {
+    const t = Date.parse(p.發布時間)
+    return !isNaN(t) && Date.now() - t <= GOV_MAX_AGE_DAYS * 86400_000
+  }
+  const 來源: FetchReport['來源'] = []
+  const items: Parsed[] = []
+  const seen = new Set<string>()
+  for (const g of groups) {
+    const kept = g.items.filter((p) => fresh(p) && !seen.has(p.原文連結))
+    kept.forEach((p) => seen.add(p.原文連結))
+    items.push(...kept)
+    來源.push({ 名稱: g.name, 收下: kept.length, 狀態: g.狀態 })
+  }
+  if (!items.length) return { items: [], 來源 }
+
+  const list = items.map((p, i) => `[${i + 1}] ${p.標題}｜${p.來源}${p.摘要 ? `｜${p.摘要.slice(0, 150)}` : ''}`).join('\n')
+  let rows: { 編號?: number; 分數?: number; 截止日?: string; 重點?: string }[] = []
+  try {
+    rows = (JSON.parse(await chatJSON(GOV_PROMPT, list, 120 * items.length, 0)) as { 結果?: typeof rows }).結果 ?? []
+  } catch (e) {
+    const rl = asRateLimit(e)
+    if (rl) throw rl
+    // 政府公告這條失敗不該拖垮熱門話題，回空的、在報告裡講清楚
+    來源.push({ 名稱: '政府公告評分', 收下: 0, 狀態: `失敗（${llmErrorMessage(e).slice(0, 60)}）` })
+    return { items: [], 來源 }
+  }
+  const out: Candidate[] = []
+  for (const r of rows) {
+    const p = items[Number(r.編號) - 1]
+    const 分數 = Number(r.分數 ?? 0)
+    if (!p || 分數 < GOV_MIN_SCORE) continue
+    const 截止日 = /^\d{4}-\d{2}-\d{2}$/.test(r.截止日 ?? '') ? r.截止日! : ''
+    if (截止日 && Date.parse(截止日) < Date.now() - 86400_000) continue // 已經截止的不收
+    out.push({
+      時間: twTime(new Date(p.發布時間)),
+      類型: '政府一手',
+      分數,
+      話題: p.標題,
+      熱度明細: null,
+      相關文章: 1,
+      截止日,
+      標題: p.標題,
+      中文標題: '',
+      來源: p.來源,
+      原文連結: p.原文連結,
+      中文報導: null,
+      圖片連結: p.圖片連結,
+      配圖: p.圖片連結 ? '是' : '否',
+      摘要: String(r.重點 ?? ''),
+      適合改寫: false,
+      改寫建議: '',
+    })
+  }
+  out.sort((a, b) => (a.截止日 || '9999').localeCompare(b.截止日 || '9999') || b.分數 - a.分數)
+  return { items: out, 來源 }
+}
+
+// 抓 → 併話題 → 量熱度，照熱度排好。前端、評估腳本、LINE 推播共用。
+export async function trendingTopics(): Promise<{ topics: Topic[]; articles: number; 來源: FetchReport['來源'] }> {
+  const { articles, 來源 } = await collectArticles()
+  let clustered
+  try {
+    clustered = await clusterTopics(articles)
+  } catch (e) {
+    const rl = asRateLimit(e)
+    if (rl) throw rl
+    throw new Error(`併話題失敗：${llmErrorMessage(e)}`)
+  }
+  const topics = await rankTopics(clustered)
+  return { topics, articles: articles.length, 來源 }
+}
+
+// 話題 → 候選：挑代表連結、找台灣中文報導、寫摘要
+export async function toCandidates(topics: Topic[]): Promise<Candidate[]> {
+  const out: (Candidate | null)[] = []
+  for (let i = 0; i < topics.length; i += REWRITE_CONCURRENCY) {
+    out.push(
+      ...(await Promise.all(
+        topics.slice(i, i + REWRITE_CONCURRENCY).map(async (t) => {
+          const rep = representative(t)
+          const zh = await zhCoverage(t)
+          let s: Summary | null
+          try {
+            s = await summarizeTopic(t, zh)
+          } catch (e) {
+            const rl = asRateLimit(e)
+            if (rl) throw rl
+            return null
+          }
+          if (!s || !s.摘要) return null
+          const d = rep.發布時間 && !isNaN(Date.parse(rep.發布時間)) ? new Date(rep.發布時間) : new Date()
+          return {
+            時間: twTime(d),
+            類型: rep.類型,
+            分數: t.熱度,
+            話題: t.話題,
+            熱度明細: t.明細,
+            相關文章: t.文章.length,
+            截止日: '',
+            標題: rep.標題,
+            中文標題: s.中文標題,
+            來源: rep.來源,
+            原文連結: await resolveGoogleNews(rep.原文連結),
+            中文報導: zh ? { 標題: zh.標題, 連結: await resolveGoogleNews(zh.連結) } : null,
+            圖片連結: rep.圖片連結,
+            配圖: rep.圖片連結 ? '是' : '否',
+            摘要: s.摘要,
+            適合改寫: s.適合改寫,
+            改寫建議: s.改寫建議,
+          } satisfies Candidate
+        })
+      ))
+    )
+  }
+  return out.filter((c): c is Candidate => c !== null)
+}
+
+// 發過的話題不再推：比網址，也比話題關鍵字有沒有出現在最近 7 天發過的標題裡
+// （同一件事換一篇文章當代表，網址就不一樣了）。
+function alreadyPosted(t: Topic, posted: { 標題: string; 原文連結: string; 發文時間: string }[]): boolean {
+  const urls = new Set(t.文章.map((a) => a.原文連結))
+  const key = t.種類 === '名稱' ? t.必含.toLowerCase() : '\u0000' // 只有名稱類的關鍵字夠準，拿來比標題
+  const weekAgo = Date.now() - 7 * 86400_000
+  return posted.some(
+    (p) =>
+      urls.has(p.原文連結) ||
+      (p.標題.toLowerCase().includes(key) && Date.parse(p.發文時間.replace(/\//g, '-')) > weekAgo)
+  )
+}
+
 export async function fetchNewsCandidates(): Promise<{
   items: Candidate[]
   scanned: number
   report: FetchReport
 }> {
-  // 兩個集合要分開，不能共用：
-  //   postedUrls＝以前發過的（判斷「這則建議過了」）
-  //   seen      ＝這一輪已經收進 parsed 的（避免同一輪重複收）
-  // 共用同一個 Set 會出事：收進 parsed 時就把網址塞進 seen，等到下面「還原轉址後再比一次」，
-  // 每一則都已經在 seen 裡了，於是整批被自己刷掉。只有 Google News 那種「還原後網址會變」的
-  // 僥倖活下來——所以來源全換成一手、不再有轉址之後，這一關就會把候選清成 0 則。
   const posted = await getPostedLog().catch(() => [])
-  const postedUrls = new Set(posted.map((e) => e.原文連結).filter(Boolean))
-  const seen = new Set(postedUrls)
-  const 來源: FetchReport['來源'] = []
-
-  // 33 條來源一定要並行抓。原本是 for 迴圈一條一條 await，單條 timeout 15 秒，
-  // 最壞情況會累積到八分鐘——前端會等到像當掉（這裡沒有 maxDuration 幫忙砍，見 route 的註解）。
-  const [hn, aiHN, lobstersAI, lobstersHot, feeds, scraped] = await Promise.all([
-    fetchHackerNews(),
-    fetchAITrending(),
-    fetchLobstersAI(),
-    fetchLobstersHot(),
-    Promise.all(
-      FEEDS.map(async (feed) => {
-        try {
-          const res = await fetch(feed.url, {
-            cache: 'no-store',
-            headers: { 'User-Agent': UA },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-          })
-          if (!res.ok) return { feed, items: [] as Parsed[], 狀態: `HTTP ${res.status}` }
-          return { feed, items: parseFeed(await res.text(), feed), 狀態: 'ok' }
-        } catch (e) {
-          return { feed, items: [] as Parsed[], 狀態: `連不上（${String(e).slice(0, 40)}）` }
-        }
-      })
-    ),
-    Promise.all(
-      SCRAPERS.map(async (s) => {
-        try {
-          const res = await fetch(s.url, {
-            cache: 'no-store',
-            headers: { 'User-Agent': UA },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-          })
-          if (!res.ok) return { feed: s, items: [] as Parsed[], 狀態: `HTTP ${res.status}` }
-          const items = s.parse(await res.text(), s)
-          // 抓得到頁面但一則都沒解出來＝版型換了，要講出來，不要當成「今天沒新聞」
-          return { feed: s, items, 狀態: items.length ? 'ok' : '版型可能已改（解不到項目）' }
-        } catch (e) {
-          return { feed: s, items: [] as Parsed[], 狀態: `連不上（${String(e).slice(0, 40)}）` }
-        }
-      })
-    ),
-  ])
-
-  const parsed: Parsed[] = []
-  const take = (list: Parsed[], maxAgeDays?: number) => {
-    let n = 0
-    for (const p of list) {
-      if (seen.has(p.原文連結) || !isFresh(p.發布時間, maxAgeDays)) continue
-      seen.add(p.原文連結)
-      parsed.push(p)
-      n++
-    }
-    return n
-  }
-  來源.push({ 名稱: 'Hacker News', 收下: take(hn), 狀態: hn.length ? 'ok' : '抓不到' })
-  來源.push({ 名稱: 'HN AI關鍵字', 收下: take(aiHN, AI_MAX_AGE_DAYS), 狀態: aiHN.length ? 'ok' : '抓不到' })
-  來源.push({ 名稱: 'Lobsters AI tag', 收下: take(lobstersAI, AI_MAX_AGE_DAYS), 狀態: lobstersAI.length ? 'ok' : '抓不到' })
-  來源.push({ 名稱: 'Lobsters', 收下: take(lobstersHot, AI_MAX_AGE_DAYS), 狀態: lobstersHot.length ? 'ok' : '抓不到' })
-  for (const f of [...feeds, ...scraped])
-    來源.push({ 名稱: f.feed.name, 收下: take(f.items, f.feed.maxAgeDays), 狀態: f.狀態 })
-
-  const deduped = dedupeByTitle(parsed)
-  const picked = interleaveBySource(deduped).slice(0, SCAN_CAP)
-  // 分批並行叫 Groq：一則一則排隊的話整趟要好幾分鐘，前端會等到像當掉。
-  // 不一次全開是為了不撞 Groq 的每分鐘 rate limit。
-  // 額度用完（429）要往外丟讓前端說清楚；其他單則失敗只丟掉那則，不賠掉整趟。
-  async function inBatches<T>(
-    xs: Parsed[],
-    fn: (n: Parsed) => Promise<T>,
-    concurrency: number
-  ): Promise<(T | null)[]> {
-    const out: (T | null)[] = []
-    for (let i = 0; i < xs.length; i += concurrency) {
-      out.push(
-        ...(await Promise.all(
-          xs.slice(i, i + concurrency).map((n) =>
-            fn(n).catch((e) => {
-              const rl = asRateLimit(e)
-              if (rl) throw rl
-              return null
-            })
-          )
-        ))
-      )
-    }
-    return out
-  }
-
-  // 第一階段：小模型整批打分，把大部分新聞在這裡就刷掉，不必付 70B 的錢。
-  // 一批失敗（額度用完／壞 JSON）只丟那一批，不要整輪炸掉；429 仍然往外丟給前端說明。
-  const scores = new Map<number, number>()
-  const offsets: number[] = []
-  let lastScoreError: unknown = null
-  for (let i = 0; i < picked.length; i += SCORE_BATCH) offsets.push(i)
-  for (let i = 0; i < offsets.length; i += SCORE_CONCURRENCY) {
-    const got = await Promise.all(
-      offsets.slice(i, i + SCORE_CONCURRENCY).map((off) =>
-        scoreBatch(picked.slice(off, off + SCORE_BATCH), off).catch((e) => {
-          const rl = asRateLimit(e)
-          if (rl) throw rl
-          lastScoreError = e
-          return new Map<number, number>()
-        })
-      )
-    )
-    for (const m of got) for (const [k, v] of m) scores.set(k, v)
-  }
-  // 每一批都炸（金鑰失效、模型名打錯）跟「今天全是低分」在畫面上長得一模一樣：都是 0 則。
-  // 實測 2026-09-17 就是這樣——OpenRouter 回 401，畫面只看到「送打分 96、低分 96」。
-  // 一批失敗可以吞，全部失敗要講出來。
-  if (picked.length && !scores.size && lastScoreError) {
-    throw new Error(`AI 打分全部失敗：${llmErrorMessage(lastScoreError)}`)
-  }
-  // 過門檻的照分數排，名額憑分數搶，不是憑來源排在前面
-  const passed = picked
-    .map((n, i) => ({ n, s: scores.get(i) ?? 0 }))
-    .filter((x) => x.s >= (x.n.門檻 ?? MIN_SCORE))
-    .sort((a, b) => b.s - a.s)
-
-  // 但純憑分數會犧牲多樣性：AI/LLM 那類天生分數高，實測 8 個名額全被它跟工程/開發吃光，
-  // 政府一手（補助徵件，7 分）明明過了門檻卻一則都上不了——那正是這個工具要看的東西。
-  // 所以先讓每個分類拿到保底名額（沒特別寫的分類保底 1 則），剩下的名額再純憑分數搶，
-  // 搶的時候有上限的分類到頂就跳過。
-  // 趨勢觀點保底 6：它們是長文、看法，「分享價值」天生比不過 OpenAI 發新模型那種硬新聞，
-  // 只保 1 則的話畫面還是整排產品公告。工程/開發封頂 4：這一組來源全是平台自己的功能公告，
-  // 就是使用者嫌「太多單一工具介紹」的主因。
-  const worthy: Parsed[] = []
-  const taken = new Set<Parsed>()
-  const perTrack = new Map<string, number>()
-  const count = (x: { n: Parsed }) => {
-    taken.add(x.n)
-    worthy.push(x.n)
-    perTrack.set(x.n.類型, (perTrack.get(x.n.類型) ?? 0) + 1)
-  }
-  for (const x of passed) {
-    if (worthy.length >= WRITE_CAP) break
-    if ((perTrack.get(x.n.類型) ?? 0) >= (TRACK_QUOTA[x.n.類型]?.min ?? 1)) continue
-    count(x)
-  }
-  for (const x of passed) {
-    if (worthy.length >= WRITE_CAP) break
-    if (taken.has(x.n)) continue
-    if ((perTrack.get(x.n.類型) ?? 0) >= (TRACK_QUOTA[x.n.類型]?.max ?? Infinity)) continue
-    count(x)
-  }
-
-  // 把 Google News 轉址還原成原文乾淨網址（其餘來源原樣）。
-  // 放在打分之後：只有真的要寫草稿的那幾則才值得多送兩個請求去還原。
-  const resolved = (
-    await Promise.all(worthy.map(async (n) => ({ ...n, 原文連結: await resolveGoogleNews(n.原文連結) })))
-  ).filter((n) => {
-    if (postedUrls.has(n.原文連結)) return false // 還原成原文網址後才認得出是「以前發過的」
-    postedUrls.add(n.原文連結)
-    return true
-  })
-
-  // 第二階段：只有過門檻的才寫摘要
-  const written = await inBatches(resolved, summarize, REWRITE_CONCURRENCY)
-
-  const items: Candidate[] = []
-  resolved.forEach((n, i) => {
-    const r = written[i]
-    if (!r || r.分數 < (n.門檻 ?? MIN_SCORE) || !r.摘要) return
-    const d = n.發布時間 && !isNaN(Date.parse(n.發布時間)) ? new Date(n.發布時間) : new Date()
-    items.push({
-      時間: twTime(d),
-      類型: n.類型,
-      分數: r.分數,
-      標題: n.標題,
-      來源: n.來源,
-      原文連結: n.原文連結,
-      圖片連結: n.圖片連結,
-      配圖: n.圖片連結 ? '是' : '否',
-      摘要: r.摘要,
-      適合改寫: r.適合改寫,
-      改寫建議: r.改寫建議,
-    })
-  })
-  return {
-    items,
-    scanned: picked.length,
-    report: {
-      抓到: parsed.length,
-      去重後: deduped.length,
-      送打分: picked.length,
-      低分: picked.length - passed.length,
-      名額外: Math.max(0, passed.length - WRITE_CAP),
-      來源,
-    },
-  }
+  // 兩條線並行：政府公告那條只有一次 LLM 呼叫，不該讓熱門話題等它
+  const [{ topics, articles, 來源 }, gov] = await Promise.all([trendingTopics(), govCandidates()])
+  const fresh = topics.filter((t) => !alreadyPosted(t, posted)).slice(0, WRITE_CAP)
+  const hot = await toCandidates(fresh)
+  const postedUrls = new Set(posted.map((p) => p.原文連結))
+  const items = [...hot, ...gov.items.filter((c) => !postedUrls.has(c.原文連結))]
+  return { items, scanned: articles, report: { 抓到: articles, 話題: topics.length, 來源: [...來源, ...gov.來源] } }
 }

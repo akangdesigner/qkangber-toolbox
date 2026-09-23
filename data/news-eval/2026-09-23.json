@@ -1,0 +1,40 @@
+{
+  "說明": "2026-09-23 那週真正紅的 AI 話題，依熱度排。來源：使用者判斷（Jev 最熱）、Google Trends、HN 10 天分數加總、The Rundown AI、AI Weekly。比對方式：正則比對話題的「話題 查詢 必含」。",
+  "第一名": "Jev",
+  "前幾名內": 3,
+  "召回門檻": 6,
+  "話題": [
+    {
+      "名稱": "Jev",
+      "比對": "jev|typesafe"
+    },
+    {
+      "名稱": "Claude Opus 5.5",
+      "比對": "opus 5\\.5"
+    },
+    {
+      "名稱": "GPT-6 Sol／Luna",
+      "比對": "\\bsol\\b|luna"
+    },
+    {
+      "名稱": "GPT-6 Astra 破解 Enigma",
+      "比對": "enigma|cipher|密文|密碼"
+    },
+    {
+      "名稱": "五角大廈：AI 導致伊朗學校誤炸",
+      "比對": "pentagon|五角|minab|school strike|誤炸"
+    },
+    {
+      "名稱": "Meta Muse 爭議",
+      "比對": "muse"
+    },
+    {
+      "名稱": "AI 巨頭呼籲放緩開發",
+      "比對": "放緩|減速|slow|amodei|暫停"
+    },
+    {
+      "名稱": "Gemini 測試中連上外部系統",
+      "比對": "gemini.*(外部|連網|越權|access|escape|系統)"
+    }
+  ]
+}
