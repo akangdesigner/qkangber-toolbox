@@ -7,14 +7,30 @@ const PUSH_URL = 'https://api.line.me/v2/bot/message/push'
 
 export type LineMessage = { type: 'text'; text: string }
 
+// 另一條路：推到使用者自己的 n8n workflow（Webhook 觸發），由 n8n 轉發到 LINE。
+// 設了 NEWS_PUSH_WEBHOOK_URL 就走這條，不用自己申請 LINE 官方帳號。
+// 送出去的 JSON：{ "messages": [{ "type": "text", "text": "…" }], "text": "全部訊息用空行接起來" }
+// n8n 那邊要單則就讀 messages，要一整段就讀 text。
 export function lineConfigured(): boolean {
-  return !!(process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_USER_ID)
+  return !!(process.env.NEWS_PUSH_WEBHOOK_URL || (process.env.LINE_CHANNEL_ACCESS_TOKEN && process.env.LINE_USER_ID))
+}
+
+async function pushWebhook(url: string, messages: LineMessage[]): Promise<void> {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, text: messages.map((m) => m.text).join('\n\n———\n\n') }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (!res.ok) throw new Error(`推到 n8n 失敗（${res.status}）：${(await res.text()).slice(0, 240)}`)
 }
 
 export async function pushLine(messages: LineMessage[]): Promise<void> {
+  const hook = process.env.NEWS_PUSH_WEBHOOK_URL
+  if (hook) return pushWebhook(hook, messages)
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN
   const to = process.env.LINE_USER_ID
-  if (!token || !to) throw new Error('缺少 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID')
+  if (!token || !to) throw new Error('缺少 NEWS_PUSH_WEBHOOK_URL，或 LINE_CHANNEL_ACCESS_TOKEN＋LINE_USER_ID')
   // 一次最多 5 個泡泡；單一文字泡泡上限 5000 字
   for (let i = 0; i < messages.length; i += 5) {
     const res = await fetch(PUSH_URL, {

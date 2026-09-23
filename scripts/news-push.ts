@@ -70,7 +70,7 @@ function format(c: Candidate): LineMessage {
 
 async function main() {
   const now = new Date()
-  if (!dry && !lineConfigured()) throw new Error('.env 沒設 LINE_CHANNEL_ACCESS_TOKEN／LINE_USER_ID（先用 --dry 測）')
+  if (!dry && !lineConfigured()) throw new Error('.env 沒設 NEWS_PUSH_WEBHOOK_URL，也沒設 LINE_CHANNEL_ACCESS_TOKEN／LINE_USER_ID（先用 --dry 測）')
   const pushed: Pushed = JSON.parse(await fs.readFile(LOG, 'utf8').catch(() => '{}'))
 
   const [{ topics, 模式 }, gov] = await Promise.all([hotTopics(), govCandidates()])
