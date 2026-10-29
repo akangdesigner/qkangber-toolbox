@@ -2,7 +2,6 @@
 
 import { useState } from 'react'
 import type { Candidate } from '@/lib/news-fetch'
-import type { PostedLog } from '@/lib/news'
 
 const typeColor: Record<string, string> = {
   'AI/LLM': 'bg-violet-500/15 text-violet-300 border-violet-500/30',
@@ -49,7 +48,7 @@ const heatTip = (c: Candidate) => {
 }
 const domainOf = (u: string) => (u.match(/https?:\/\/([^/]+)/)?.[1] || u).replace(/^www\./, '')
 
-export default function NewsBoard({ history }: { history: PostedLog[] }) {
+export default function NewsBoard() {
   const [candidates, setCandidates] = useState<Candidate[]>([])
   const [drafts, setDrafts] = useState<Record<string, Record<VKey, string>>>({})
   const [tab, setTab] = useState<Record<string, VKey>>({})
@@ -61,7 +60,6 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
   const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
   const [onlyRewrite, setOnlyRewrite] = useState(false)
-  const [posted, setPosted] = useState<PostedLog[]>(history)
   const [mode, setMode] = useState('') // 這次是用 Google Trends 找的，還是退回新聞來源
 
   // 以前分「中文／英文」兩區：改成熱度排序後，這樣分會打亂順序（代表文章剛好是中文的話題永遠排前面），
@@ -129,24 +127,12 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
     const res = await fetch('/api/news', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, 圖片連結: c.圖片連結, 配圖, 類型: c.類型, 標題: c.標題, 來源: c.來源, 原文連結: c.原文連結 }),
+      body: JSON.stringify({ text, 圖片連結: c.圖片連結, 配圖 }),
     })
     const json = await res.json().catch(() => ({}))
     setBusy(null)
     if (res.ok && json.ok) {
       setCandidates((prev) => prev.filter((x) => x.原文連結 !== c.原文連結))
-      setPosted((prev) => [
-        {
-          發文時間: new Date().toLocaleString('zh-TW', { hour12: false }),
-          類型: c.類型,
-          標題: c.標題,
-          來源: c.來源,
-          原文連結: c.原文連結,
-          發文內容: text,
-          Threads連結: json.permalink || '',
-        },
-        ...prev,
-      ])
       alert('已發布到 Threads ✓' + (json.permalink ? '\n' + json.permalink : ''))
     } else {
       alert('發文失敗：' + (json.error || res.status))
@@ -425,25 +411,6 @@ export default function NewsBoard({ history }: { history: PostedLog[] }) {
         </section>
       )}
 
-      {posted.length > 0 && (
-        <section>
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">已發紀錄（{posted.length}）</h2>
-          <div className="space-y-2">
-            {posted.slice(0, 30).map((p, i) => (
-              <div key={i} className="flex items-center gap-2 rounded-lg border border-white/5 bg-white/[0.02] px-4 py-2.5 text-sm text-slate-400">
-                <span className="truncate">
-                  <span className="text-slate-500">{p.發文時間} · {p.來源}</span> · {(p.發文內容 || p.標題).slice(0, 50)}
-                </span>
-                {p.Threads連結 && (
-                  <a href={p.Threads連結} target="_blank" rel="noreferrer" className="ml-auto shrink-0 text-violet-400 hover:text-violet-300">
-                    看貼文 ↗
-                  </a>
-                )}
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
     </div>
   )
 }

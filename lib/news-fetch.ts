@@ -7,7 +7,7 @@
 // 現在 LLM 只負責「哪些文章在講同一件事」和寫摘要，「重不重要」交給外部熱度（見 lib/news-trending）。
 // 改這支之前後都要跑 scripts/news-eval.ts，看熱門話題的召回率，不要只看「抓到幾則」。
 import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
-import { getPostedLog, twTime } from '@/lib/news'
+import { twTime } from '@/lib/news'
 import { cleanStoryText } from '@/lib/hn-fetch'
 import { clusterTopics, rankTopics, zhCoverage, type Article, type Heat, type Topic } from '@/lib/news-trending'
 import { trendsTopics } from '@/lib/news-trends'
@@ -15,11 +15,11 @@ import { TrendsBlockedError } from '@/lib/google-trends'
 
 type Feed = { name: string; track: string; url: string; max?: number } // max：這條收幾則，預設 PER_FEED
 
-// 候選（只活在前端，發出去才寫進發文紀錄）。一則候選＝一個話題，連結是話題裡最像第一手的那篇。
+// 候選（只活在前端，不存表）。一則候選＝一個話題，連結是話題裡最像第一手的那篇。
 export type Candidate = {
   時間: string // 代表文章的發布時間，台灣時間精確到小時
   類型: string
-  分數: number // 熱度 0-100（欄位名沿用舊的，發文紀錄與前端都認這個）
+  分數: number // 熱度 0-100（欄位名沿用舊的，前端認這個）
   話題: string
   熱度明細: Heat | null // 政府公告沒有熱度（見 GOV_FEEDS），是 null
   相關文章: number // 抓到幾篇在講這件事
@@ -618,30 +618,14 @@ export async function toCandidates(topics: Topic[]): Promise<Candidate[]> {
   return out.filter((c): c is Candidate => c !== null)
 }
 
-// 發過的話題不再推：比網址，也比話題關鍵字有沒有出現在最近 7 天發過的標題裡
-// （同一件事換一篇文章當代表，網址就不一樣了）。
-function alreadyPosted(t: Topic, posted: { 標題: string; 原文連結: string; 發文時間: string }[]): boolean {
-  const urls = new Set(t.文章.map((a) => a.原文連結))
-  const key = t.種類 === '名稱' ? t.必含.toLowerCase() : '\u0000' // 只有名稱類的關鍵字夠準，拿來比標題
-  const weekAgo = Date.now() - 7 * 86400_000
-  return posted.some(
-    (p) =>
-      urls.has(p.原文連結) ||
-      (p.標題.toLowerCase().includes(key) && Date.parse(p.發文時間.replace(/\//g, '-')) > weekAgo)
-  )
-}
-
 export async function fetchNewsCandidates(): Promise<{
   items: Candidate[]
   scanned: number
   report: FetchReport
 }> {
-  const posted = await getPostedLog().catch(() => [])
   // 兩條線並行：政府公告那條只有一次 LLM 呼叫，不該讓熱門話題等它
   const [{ topics, 模式, articles, 來源 }, gov] = await Promise.all([hotTopics(), govCandidates()])
-  const fresh = topics.filter((t) => !alreadyPosted(t, posted)).slice(0, WRITE_CAP)
-  const hot = await toCandidates(fresh)
-  const postedUrls = new Set(posted.map((p) => p.原文連結))
-  const items = [...hot, ...gov.items.filter((c) => !postedUrls.has(c.原文連結))]
+  const hot = await toCandidates(topics.slice(0, WRITE_CAP))
+  const items = [...hot, ...gov.items]
   return { items, scanned: articles, report: { 模式, 抓到: articles, 話題: topics.length, 來源: [...來源, ...gov.來源] } }
 }
