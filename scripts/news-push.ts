@@ -45,13 +45,10 @@ function format(c: Candidate): LineMessage {
   if (!c.熱度明細) return formatGov(c)
   const h = c.熱度明細
   const signals = [
-    h.台灣 ? `台灣搜尋量 ${h.台灣.toFixed(1)} 倍` : '',
-    h.全球 ? `全球 ${h.全球.toFixed(2)} 倍` : '',
-    h.漲幅 ? `竄升 ${h.漲幅}` : '',
-    h.來源數 > 1 ? `${h.來源數} 個來源` : '',
+    h.爆點 ? `${h.爆點}` : '',
+    h.來源數 > 1 ? `${h.來源數} 家媒體` : '',
     h.hn ? `HN ${h.hn} 分` : '',
-    h.新聞 ? `${h.新聞} 篇報導` : '',
-    h.搜尋 && h.台灣 === undefined ? `搜尋量 Claude AI 的 ${Math.round(h.搜尋 * 100)}%` : '',
+    h.搜尋 ? `搜尋量 Claude AI 的 ${Math.round(h.搜尋 * 100)}%` : '',
   ].filter(Boolean)
   const text = [
     `🔥 熱度 ${c.分數}｜${c.中文標題 || c.話題}`,

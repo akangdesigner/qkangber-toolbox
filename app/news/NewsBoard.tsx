@@ -26,16 +26,9 @@ const stripUrls = (s: string) =>
 const heatTip = (c: Candidate) => {
   const h = c.熱度明細
   if (!h) return ''
-  // Google Trends 那條線：搜尋量用「是 Claude AI 的幾倍」講（台灣、全球各一個），再加最猛的漲幅
-  if (h.台灣 !== undefined || h.全球 !== undefined) {
-    return [
-      h.台灣 ? `台灣搜尋量是 Claude AI 的 ${h.台灣.toFixed(1)} 倍` : '台灣沒資料',
-      h.全球 ? `全球 ${h.全球.toFixed(2)} 倍` : '',
-      h.漲幅 ? `竄升 ${h.漲幅}` : '',
-      h.搜尋詞?.length ? `大家搜「${h.搜尋詞.slice(0, 3).join('」「')}」` : '',
-    ]
-      .filter(Boolean)
-      .join('・')
+  // Threads 爆點那條線：講它在 Threads 上會怎麼被討論，再加幾家媒體在報
+  if (h.爆點分 !== undefined) {
+    return [h.爆點 ? `🔥 ${h.爆點}` : '', `爆點 ${h.爆點分} 分`, `${h.來源數} 家媒體報`].filter(Boolean).join('・')
   }
   return [
     `${h.來源數} 個來源在講`,
@@ -60,7 +53,7 @@ export default function NewsBoard() {
   const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
   const [onlyRewrite, setOnlyRewrite] = useState(false)
-  const [mode, setMode] = useState('') // 這次是用 Google Trends 找的，還是退回新聞來源
+  const [mode, setMode] = useState('') // 這次是用 Threads 爆點找的，還是退回新聞來源
 
   // 以前分「中文／英文」兩區：改成熱度排序後，這樣分會打亂順序（代表文章剛好是中文的話題永遠排前面），
   // 而且每個話題都有中文標題了。改分「熱門話題（照熱度）」和「政府公告（照截止日）」兩區。

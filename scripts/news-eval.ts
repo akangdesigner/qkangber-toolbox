@@ -16,6 +16,8 @@ type Fixture = {
   前幾名內: number
   召回門檻: number
   話題: { 名稱: string; 比對: string }[]
+  // 使用者點名不要的（產品發表、企業導入…）：出現在前「名次」名就算不及格
+  不該前幾名?: { 名次: number; 話題: { 名稱: string; 比對: string }[] }
 }
 
 const TOP_N = 12 // 跟 lib/news-fetch 的 WRITE_CAP 一樣：板上看得到的就是前 12 個
@@ -32,26 +34,13 @@ async function main() {
   const broken = 來源.filter((s) => s.狀態 !== 'ok' || s.收下 === 0)
   if (broken.length) console.log(`[eval] 沒收到東西的來源：${broken.map((s) => `${s.名稱}(${s.狀態})`).join('、')}`)
 
-  const trendsOK = topics.some((t) => t.明細.搜尋 !== null)
-  if (!trendsOK) console.log('[eval] ⚠ Google Trends 沒抓到（被擋？），熱度只用 HN＋新聞兩個訊號')
-
-  if (模式 === 'Google Trends') {
-    console.log('\n排名  熱度   台灣    全球    漲幅            話題（大家搜的詞）')
-    topics.slice(0, 25).forEach((t, i) => {
-      const h = t.明細
-      console.log(
-        `${String(i + 1).padStart(3)}   ${String(t.熱度).padStart(3)}   ${h.台灣 == null ? '  -  ' : h.台灣.toFixed(2).padStart(5)}   ${
-          h.全球 == null ? '  -  ' : h.全球.toFixed(2).padStart(5)
-        }   ${(h.漲幅 ?? '').padEnd(14)}  ${t.話題}（${(h.搜尋詞 ?? []).slice(0, 3).join('、')}）`
-      )
-    })
-  } else console.log('\n排名  熱度   HN分(篇)    新聞  搜尋  來源  話題（查詢；#＝事件，*＝籠統、沒拿去外部搜）')
-  if (模式 !== 'Google Trends') topics.slice(0, 25).forEach((t, i) => {
+  console.log('\n排名  熱度  爆點分  媒體  篇數  話題（查詢）｜爆點')
+  topics.slice(0, 25).forEach((t, i) => {
     const h = t.明細
     console.log(
-      `${String(i + 1).padStart(3)}   ${String(t.熱度).padStart(3)}   ${String(h.hn).padStart(5)}(${String(h.hn篇數).padStart(2)})   ${String(h.新聞).padStart(4)}  ${
-        h.搜尋 === null ? '  - ' : h.搜尋.toFixed(2)
-      }  ${String(h.來源數).padStart(3)}   ${t.話題}（${t.查詢}${t.種類 === '名稱' ? '' : t.種類 === '事件' ? '#' : '*'}）`
+      `${String(i + 1).padStart(3)}   ${String(t.熱度).padStart(3)}   ${String(h.爆點分 ?? '-').padStart(4)}   ${String(h.來源數).padStart(3)}  ${String(
+        t.文章.length
+      ).padStart(3)}   ${t.話題}（${t.查詢}）${h.爆點 ? `｜${h.爆點}` : ''}`
     )
   })
 
@@ -77,11 +66,22 @@ async function main() {
       }`
     )
   }
-  const pass1 = firstRank !== null && firstRank <= 1
+  let passBan = true
+  if (fx.不該前幾名) {
+    const n = fx.不該前幾名.名次
+    console.log(`\n不該排進前 ${n} 名：`)
+    for (const e of fx.不該前幾名.話題) {
+      const r = rankOf(e.比對)
+      const bad = r !== null && r <= n
+      if (bad) passBan = false
+      console.log(`  ${bad ? '❌' : '✅'} ${e.名稱}：${r === null ? '沒上板' : `第 ${r} 名`}`)
+    }
+  }
+  const pass1 = firstRank !== null && firstRank <= fx.前幾名內
   const passRecall = hit >= fx.召回門檻
   console.log(`\n召回率 ${hit}/${fx.話題.length}（門檻 ${fx.召回門檻}）${passRecall ? '✅' : '❌'}`)
-  console.log(`${fx.第一名} 排第 ${firstRank ?? '—'} 名（要第 1）${pass1 ? '✅' : '❌'}`)
-  process.exitCode = pass1 && passRecall ? 0 : 1
+  console.log(`${fx.第一名} 排第 ${firstRank ?? '—'} 名（要前 ${fx.前幾名內}）${pass1 ? '✅' : '❌'}`)
+  process.exitCode = pass1 && passRecall && passBan ? 0 : 1
 }
 
 main().catch((e) => {

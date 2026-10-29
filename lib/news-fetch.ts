@@ -10,8 +10,7 @@ import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
 import { twTime } from '@/lib/news'
 import { cleanStoryText } from '@/lib/hn-fetch'
 import { clusterTopics, rankTopics, zhCoverage, type Article, type Heat, type Topic } from '@/lib/news-trending'
-import { trendsTopics } from '@/lib/news-trends'
-import { TrendsBlockedError } from '@/lib/google-trends'
+import { threadsTopics } from '@/lib/news-threads'
 
 type Feed = { name: string; track: string; url: string; max?: number } // max：這條收幾則，預設 PER_FEED
 
@@ -409,7 +408,7 @@ function isFresh(發布時間: string): boolean {
 }
 
 export type FetchReport = {
-  模式: string // 「Google Trends」或「新聞來源（Trends 被擋）」，前端要講清楚這次是怎麼找的
+  模式: string // 「Threads 爆點」或退回的「新聞來源」，前端要講清楚這次是怎麼找的
   抓到: number
   話題: number
   來源: { 名稱: string; 收下: number; 狀態: string }[]
@@ -555,22 +554,19 @@ export async function trendingTopics(): Promise<{ topics: Topic[]; articles: num
   return { topics, articles: articles.length, 來源 }
 }
 
-// 找熱門話題：先用 Google Trends（大家在搜什麼，見 lib/news-trends），
-// 被擋或找不到東西就退回新聞來源那套（先抓新聞、再量熱度），板子不會空掉。
+// 找熱門話題：照「Threads 上會不會爆」排（見 lib/news-threads），
+// 失敗或找不到東西就退回新聞來源那套（先抓新聞、再量熱度），板子不會空掉。
 export async function hotTopics(): Promise<{ topics: Topic[]; 模式: string; articles: number; 來源: FetchReport['來源'] }> {
   try {
-    const topics = await trendsTopics()
-    if (topics.length >= 3) return { topics, 模式: 'Google Trends', articles: 0, 來源: [] }
+    const topics = await threadsTopics()
+    if (topics.length >= 3) return { topics, 模式: 'Threads 爆點', articles: topics.reduce((n, t) => n + t.文章.length, 0), 來源: [] }
   } catch (e) {
-    if (!(e instanceof TrendsBlockedError)) {
-      const rl = asRateLimit(e)
-      if (rl) throw rl
-    }
-    // 其他錯誤（Trends 格式變了、LLM 回壞 JSON）一樣退回，不讓整輪掛掉
-    console.error('[news] Google Trends 失敗，退回新聞來源：', String(e).slice(0, 200))
+    const rl = asRateLimit(e)
+    if (rl) throw rl
+    console.error('[news] Threads 爆點失敗，退回新聞來源：', String(e).slice(0, 200))
   }
   const r = await trendingTopics()
-  return { topics: r.topics, 模式: '新聞來源（Google Trends 被擋或沒資料）', articles: r.articles, 來源: r.來源 }
+  return { topics: r.topics, 模式: '新聞來源（Threads 爆點那條失敗）', articles: r.articles, 來源: r.來源 }
 }
 
 // 話題 → 候選：挑代表連結、找台灣中文報導、寫摘要
