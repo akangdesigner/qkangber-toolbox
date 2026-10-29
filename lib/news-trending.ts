@@ -10,7 +10,7 @@
 //   Google Trends（7 天，對照詞 Claude AI）：一般人的搜尋熱度。這是唯一把 Jev 排第一的訊號
 //     （實測 Jev 31、GPT-6 5、Opus 5.5 1；HN 分數則是 Opus／GPT-6 較高）。
 //     對照詞不能用 ChatGPT：它太大，其他詞全被壓成 0。Trends 不是官方 API，被擋就少這個訊號，不賠掉整輪。
-import { chatJSON } from '@/lib/llm-json'
+import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
@@ -166,15 +166,18 @@ export async function clusterTopics(articles: Article[]): Promise<Omit<Topic, '�
   const offsets: number[] = []
   for (let i = 0; i < articles.length; i += EXTRACT_BATCH) offsets.push(i)
   let failed = 0
+  let lastErr: unknown
   const maps = await pool(offsets, EXTRACT_CONCURRENCY, (off) =>
     extractBatch(articles.slice(off, off + EXTRACT_BATCH), off).catch((e) => {
       // 429／額度用完要往外丟讓前端講清楚；其他錯誤只丟這一批
       if (/429|402|rate_limit|credits/.test(String(e))) throw e
       failed++
+      lastErr = e
       return new Map<number, Extracted>()
     })
   )
-  if (failed === offsets.length) throw new Error('每一批都失敗了')
+  // 把原因帶出去：線上 OpenRouter 金鑰失效（401）時，畫面只寫「每一批都失敗了」，看不出是金鑰的問題（2026-10-29）
+  if (failed === offsets.length) throw new Error(`每一批都失敗了（${llmErrorMessage(lastErr)}）`)
 
   // 照主角分組（大小寫不分）
   const groups = new Map<string, { idx: number; e: Extracted }[]>()
