@@ -394,7 +394,7 @@ export default function NewsBoard() {
       )}
 
       {candidates.length === 0 && (
-        <p className="text-sm text-slate-500">按「抓最新新聞」開始。候選只留在這頁，重新整理就會清掉；發出去的會記在下方。</p>
+        <p className="text-sm text-slate-500">按「抓最新新聞」開始。候選只留在這頁，重新整理就會清掉。</p>
       )}
 
       {hot.length > 0 && (
