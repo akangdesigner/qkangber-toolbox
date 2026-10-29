@@ -30,6 +30,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 export class TrendsClient {
   private cookie = ''
   private last = 0
+  // 重試完還是 429 就記下來，這一輪後面的請求直接放棄。
+  // 以前每一批各自再等兩分鐘：被擋之後 18 批搜尋量比較一路等下去，整輪拖到快 5 分鐘，前端等不到（2026-10-29）。
+  private blocked = false
 
   private async init() {
     if (this.cookie) return
@@ -55,8 +58,16 @@ export class TrendsClient {
     return data
   }
 
+  // 只查快取、不抓：沒有或過期回 undefined
+  private async peek<T>(key: string): Promise<T | undefined> {
+    if (!this.cache) this.cache = JSON.parse(await fs.readFile(CACHE_FILE, 'utf8').catch(() => '{}'))
+    const hit = this.cache![key]
+    return hit && Date.now() - hit.at < CACHE_TTL_MS ? (hit.data as T) : undefined
+  }
+
   // 回應前面有一段防 XSSI 的垃圾（")]}'"），從第一個 { 開始才是 JSON
   private async get(url: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
+    if (this.blocked) throw new TrendsBlockedError(429)
     await this.init()
     for (let attempt = 0; attempt <= RETRIES; attempt++) {
       const wait = this.last + GAP_MS - Date.now()
@@ -70,10 +81,14 @@ export class TrendsClient {
         await sleep(BACKOFF_MS)
         continue
       }
-      if (!res.ok) throw new TrendsBlockedError(res.status)
+      if (!res.ok) {
+        if (res.status === 429) this.blocked = true
+        throw new TrendsBlockedError(res.status)
+      }
       const text = await res.text()
       return JSON.parse(text.slice(text.indexOf('{')))
     }
+    this.blocked = true
     throw new TrendsBlockedError(429)
   }
 
@@ -104,17 +119,27 @@ export class TrendsClient {
 
   // 幾個詞跟對照詞比過去 7 天的平均搜尋量，回傳「是對照詞的幾倍」。一次最多 4 個詞（加對照詞共 5 個，Trends 的上限）。
   // 被擋的那批就跳過（那幾個詞沒有值），不讓整輪失敗。
+  // 快取一個詞一筆：都是跟同一個對照詞比，倍數跟同批是誰無關。以前整批當一筆，
+  // 話題每輪併得不太一樣、批次組合就變，幾乎查不到快取，每輪都要重比 70 個詞。
   async ratios(keywords: string[], anchor: string, geo: Geo): Promise<Map<string, number>> {
     const out = new Map<string, number>()
-    for (let i = 0; i < keywords.length; i += 4) {
-      const batch = keywords.slice(i, i + 4)
-      const got = await this.cached(`ratios|${anchor}|${geo}|${batch.join('|')}`, () =>
-        this.ratiosRaw(batch, anchor, geo)
-      ).catch((e) => {
+    const key = (k: string) => `ratio|${anchor}|${geo}|${k}`
+    const todo: string[] = []
+    for (const k of keywords) {
+      const hit = await this.peek<number>(key(k))
+      if (hit === undefined) todo.push(k)
+      else out.set(k, hit)
+    }
+    for (let i = 0; i < todo.length; i += 4) {
+      const batch = todo.slice(i, i + 4)
+      const got = await this.ratiosRaw(batch, anchor, geo).catch((e) => {
         if (e instanceof TrendsBlockedError) return {} as Record<string, number>
         throw e
       })
-      for (const [k, v] of Object.entries(got)) out.set(k, v)
+      for (const [k, v] of Object.entries(got)) {
+        out.set(k, v)
+        await this.cached(key(k), async () => v)
+      }
     }
     return out
   }
