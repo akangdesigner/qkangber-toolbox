@@ -16,7 +16,7 @@ type Feed = { name: string; track: string; url: string; max?: number } // max：
 
 // 候選（只活在前端，不存表）。一則候選＝一個話題，連結是話題裡最像第一手的那篇。
 export type Candidate = {
-  時間: string // 代表文章的發布時間，台灣時間精確到小時
+  時間: string // 熱門話題＝最早一篇報導的時間；政府公告＝公告時間。台灣時間 YYYY/MM/DD HH:mm，可直接字串比大小
   類型: string
   分數: number // 熱度 0-100（欄位名沿用舊的，前端認這個）
   話題: string
@@ -587,7 +587,10 @@ export async function toCandidates(topics: Topic[]): Promise<Candidate[]> {
             return null
           }
           if (!s || !s.摘要) return null
-          const d = rep.發布時間 && !isNaN(Date.parse(rep.發布時間)) ? new Date(rep.發布時間) : new Date()
+          // 時間＝這件事最早被報的時間，前端「照新舊排」靠這個判斷是不是舊事件。
+          // 不用代表文章的時間：代表文章優先挑官方，常常比話題本身還舊或還新。
+          const times = t.文章.map((a) => Date.parse(a.發布時間)).filter((n) => !isNaN(n))
+          const d = times.length ? new Date(Math.min(...times)) : new Date()
           return {
             時間: twTime(d),
             類型: rep.類型,

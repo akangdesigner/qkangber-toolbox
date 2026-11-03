@@ -53,12 +53,15 @@ export default function NewsBoard() {
   const [saved, setSaved] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
   const [onlyRewrite, setOnlyRewrite] = useState(false)
+  const [sortBy, setSortBy] = useState<'熱度' | '最新'>('熱度')
   const [mode, setMode] = useState('') // 這次是用 Threads 爆點找的，還是退回新聞來源
 
   // 以前分「中文／英文」兩區：改成熱度排序後，這樣分會打亂順序（代表文章剛好是中文的話題永遠排前面），
   // 而且每個話題都有中文標題了。改分「熱門話題（照熱度）」和「政府公告（照截止日）」兩區。
   const rewriteFiltered = onlyRewrite ? candidates.filter((c) => c.適合改寫) : candidates
-  const hot = rewriteFiltered.filter((c) => c.類型 !== '政府一手')
+  // 時間格式是 YYYY/MM/DD HH:mm，字串比大小就是新舊
+  const hotAll = rewriteFiltered.filter((c) => c.類型 !== '政府一手')
+  const hot = sortBy === '最新' ? [...hotAll].sort((a, b) => b.時間.localeCompare(a.時間)) : hotAll
   const gov = onlyRewrite ? [] : candidates.filter((c) => c.類型 === '政府一手')
   const rewriteCount = candidates.filter((c) => c.適合改寫).length
 
@@ -230,7 +233,7 @@ export default function NewsBoard() {
                 </span>
               )}
               <span className="text-slate-500">{c.來源}</span>
-              {c.時間 && <span className="ml-auto text-slate-500">🕒 {c.時間}</span>}
+              {c.時間 && <span className="ml-auto text-slate-500">🕒 {c.類型 === '政府一手' ? '' : '最早報導 '}{c.時間}</span>}
             </div>
             <h3 className="text-lg font-semibold text-white leading-snug mb-1">{c.中文標題 || c.標題}</h3>
             {c.中文標題 && <p className="text-xs text-slate-500 mb-2">{c.標題}</p>}
@@ -378,6 +381,19 @@ export default function NewsBoard() {
             ✍️ 只看適合改寫（{rewriteCount}）
           </button>
         )}
+        {candidates.length > 0 && (
+          <div className="flex rounded-full border border-white/10 overflow-hidden text-xs">
+            {(['熱度', '最新'] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setSortBy(k)}
+                className={`px-3 py-1 transition-colors ${sortBy === k ? 'bg-violet-600 text-white' : 'bg-white/5 text-slate-400 hover:text-slate-200'}`}
+              >
+                {k === '熱度' ? '🔥 照熱度' : '🕒 照新舊'}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {mode && candidates.length > 0 && (
@@ -392,7 +408,7 @@ export default function NewsBoard() {
 
       {hot.length > 0 && (
         <section>
-          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">🔥 熱門話題（{hot.length}，照熱度排）</h2>
+          <h2 className="text-xs uppercase tracking-widest text-slate-500 mb-4">🔥 熱門話題（{hot.length}，{sortBy === '熱度' ? '照熱度排' : '新的在前'}）</h2>
           <div className="space-y-6">{hot.map((c) => Card(c))}</div>
         </section>
       )}
