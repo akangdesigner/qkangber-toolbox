@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 每天 15:00 跑一次熱門 AI 話題 LINE 推播（scripts/news-push-mac.sh）。Mac 那時在睡眠的話，醒來後會補跑一次。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.qkangber.news-push</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/kc/qkangber-toolbox/scripts/news-push-mac.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>15</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardErrorPath</key>
+  <string>/Users/kc/qkangber-toolbox/data/news-push/launchd.err</string>
+</dict>
+</plist>

@@ -1,6 +1,8 @@
 // 推到 LINE：熱度超過門檻的 AI 話題，加上申請得到的政府補助／徵件公告，沒推過的才推。
 // 用法：npx tsx --env-file=.env scripts/news-push.ts [--dry]（--dry 只印不推，也不記錄）
-// 由 Windows 工作排程器（見 scripts/news-push-task.vbs）每天跑幾次，不需要 dev server 在跑。
+// 排程：Mac 用 launchd 每天 15:00 跑一次（見 scripts/news-push-mac.sh、scripts/com.qkangber.news-push.plist）；
+// Windows 用工作排程器（見 scripts/news-push-task.vbs）。不需要 dev server 在跑。
+// 2026-11-03 以前只設過 Windows 的排程，換到 Mac 後一次都沒跑過，使用者從來沒收到推播。
 //
 // 門檻 NEWS_PUSH_MIN_HEAT（預設 65）：用 2026-09-23 的訊號算，Jev 95、Claude Opus 5.5 69、GPT-6 Sol 67，
 // 再下去的 GPT-6 Astra、Grok 4.7 都在 60 以下。65 等於「這週最紅的兩三件事」，不會變成洗版。
