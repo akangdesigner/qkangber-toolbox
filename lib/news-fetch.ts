@@ -554,11 +554,30 @@ export async function trendingTopics(): Promise<{ topics: Topic[]; articles: num
   return { topics, articles: articles.length, 來源 }
 }
 
-// 找熱門話題：照「Threads 上會不會爆」排（見 lib/news-threads），
+// 新舊折扣：照「最早一篇報導」距今幾天打折，今天的不扣，每天扣 12%，最低剩 3 成。
+// 2026-11-03 使用者嫌「每天都抓一樣的舊文章」：熱度原本完全不看新舊，而且一件事放越久報的媒體越多，
+// 5 天前的大事件會天天壓在今天的新事件上面。用最早那篇而不是最新那篇：大事件每天都有新報導，看最新那篇等於沒扣。
+// 很紅的舊事件打 3 折後還是可能上板（7 天範圍不動），只是讓位給新的。
+const DECAY_PER_DAY = 0.12
+const DECAY_FLOOR = 0.3
+function withFreshness(topics: Topic[]): Topic[] {
+  const now = Date.now()
+  return topics
+    .map((t) => {
+      const times = t.文章.map((a) => Date.parse(a.發布時間)).filter((n) => !isNaN(n))
+      const 天數 = times.length ? Math.max(0, (now - Math.min(...times)) / 86400_000) : 0
+      const 新舊折扣 = Math.max(DECAY_FLOOR, 1 - DECAY_PER_DAY * 天數)
+      return { ...t, 熱度: Math.round(t.熱度 * 新舊折扣), 明細: { ...t.明細, 天數: Math.round(天數 * 10) / 10, 新舊折扣 } }
+    })
+    .sort((a, b) => b.熱度 - a.熱度)
+}
+
+// 找熱門話題：照「Threads 上會不會爆」排（見 lib/news-threads），再照新舊打折（見 withFreshness）。
 // 失敗或找不到東西就退回新聞來源那套（先抓新聞、再量熱度），板子不會空掉。
 export async function hotTopics(): Promise<{ topics: Topic[]; 模式: string; articles: number; 來源: FetchReport['來源'] }> {
   try {
-    const topics = await threadsTopics()
+    const raw = await threadsTopics()
+    const topics = withFreshness(raw)
     if (topics.length >= 3) return { topics, 模式: 'Threads 爆點', articles: topics.reduce((n, t) => n + t.文章.length, 0), 來源: [] }
   } catch (e) {
     const rl = asRateLimit(e)
@@ -566,7 +585,7 @@ export async function hotTopics(): Promise<{ topics: Topic[]; 模式: string; ar
     console.error('[news] Threads 爆點失敗，退回新聞來源：', String(e).slice(0, 200))
   }
   const r = await trendingTopics()
-  return { topics: r.topics, 模式: '新聞來源（Threads 爆點那條失敗）', articles: r.articles, 來源: r.來源 }
+  return { topics: withFreshness(r.topics), 模式: '新聞來源（Threads 爆點那條失敗）', articles: r.articles, 來源: r.來源 }
 }
 
 // 話題 → 候選：挑代表連結、找台灣中文報導、寫摘要

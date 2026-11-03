@@ -39,6 +39,9 @@ export type Heat = {
   // 以下只有「Threads 爆點」那條線有（lib/news-threads）：LLM 判斷發到 Threads 會不會爆（0-100）、會怎麼被討論
   爆點分?: number
   爆點?: string
+  // 新舊折扣（lib/news-fetch 的 hotTopics 加上去）：最早報導距今幾天、熱度乘了多少
+  天數?: number
+  新舊折扣?: number
 }
 
 export type Topic = {

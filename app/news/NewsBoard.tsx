@@ -22,19 +22,23 @@ const emptyDrafts = (): Record<VKey, string> => ({ 感性: '', 技術: '', 討�
 
 const stripUrls = (s: string) =>
   (s || '').replace(/https?:\/\/\S+/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+// 舊事件的熱度有打折（見 lib/news-fetch 的 withFreshness），講出來，不然會以為分數算錯
+const fresh = (h: NonNullable<Candidate['熱度明細']>) =>
+  h.新舊折扣 !== undefined && h.新舊折扣 < 0.99 ? `${Math.floor(h.天數 ?? 0)} 天前的事，熱度打 ${Math.round(h.新舊折扣 * 10)} 折` : ''
 // 熱度是四個訊號合成的，光一個數字看不出「為什麼紅」，把明細攤開
 const heatTip = (c: Candidate) => {
   const h = c.熱度明細
   if (!h) return ''
   // Threads 爆點那條線：講它在 Threads 上會怎麼被討論，再加幾家媒體在報
   if (h.爆點分 !== undefined) {
-    return [h.爆點 ? `🔥 ${h.爆點}` : '', `爆點 ${h.爆點分} 分`, `${h.來源數} 家媒體報`].filter(Boolean).join('・')
+    return [h.爆點 ? `🔥 ${h.爆點}` : '', `爆點 ${h.爆點分} 分`, `${h.來源數} 家媒體報`, fresh(h)].filter(Boolean).join('・')
   }
   return [
     `${h.來源數} 個來源在講`,
     h.hn ? `HN ${h.hn} 分（${h.hn篇數} 篇）` : '',
     h.新聞 ? `${h.新聞} 篇報導` : '',
     h.搜尋 !== null && h.搜尋 > 0 ? `搜尋量是 Claude AI 的 ${Math.round(h.搜尋 * 100)}%` : '',
+    fresh(h),
   ]
     .filter(Boolean)
     .join('・')
