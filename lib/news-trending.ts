@@ -72,11 +72,15 @@ const EXTRACT_PROMPT = `你是 AI 新聞編輯。我會給你一批最近一週�
   * 產品或模型就用它的名字：「Jev」「Claude Opus 5.5」「GPT-6 Sol」「Meta Muse」「Grok 4.7」。
   * 模仿、複製、評測、比較、跟進上架某個東西的文章，主角寫被模仿的那個原版：「Kev: Tiny Jev-like models」「OpenJev」「Vercel 上架 Jev」「我一年前就做過 Jev 這種架構」主角都是「Jev」。
   * 同一系列不同產品要分開：「GPT-6 Sol」和「GPT-6 Astra」是不同主角。
+    但同一次一起發表的幾個產品算同一件事，主角都寫最主要那個：Anthropic 同時發表 Fable 5.2 和 Mythos 5.2，只講 Mythos 的那篇主角也寫「Claude Fable 5.2」。
+  * 產品「出事」是另一件事，不是產品本身：外洩、漏洞、被禁用、被告、停用這類，種類寫「事件」，查詢寫產品名加關鍵字。
+    例：Claude Code 外洩密碼 → 主角「Claude Code」、查詢「Claude Code secrets」；高盛禁用 Claude Code → 主角「Claude Code」、查詢「Goldman Claude Code」。
+  * 公司本身發生的具體事件（上市、併購、裁員、執行長出事）也是「事件」，查詢是公司名加關鍵字：「Anthropic IPO」「Nvidia Jensen Huang affair」。
   * 沒有產品名的事件，用事件裡最關鍵的人名、機構名：五角大廈承認 AI 導致誤炸 →「Pentagon」；Amodei 呼籲放緩 AI 開發 →「Amodei」。
   * 同一件事不管在哪一篇，主角都要寫得一模一樣（大小寫、空格都一樣），這樣我才併得起來。
 - 查詢：拿去 Google 搜尋這件事用的 1 到 3 個英文字。產品就是它的名字（「Jev」「Claude Opus 5.5」「Meta Muse」）；
   事件是主角加 1-2 個關鍵字（「Pentagon AI strike」「Amodei AI slowdown」）。不要加描述詞，「Jev decision model」是錯的。
-- 種類：「名稱」（查詢是產品或模型的專有名詞）、「事件」（查詢是主角加關鍵字）、「籠統」（講的是 OpenAI、Google 這種整家公司，或整個領域，沒有一件具體的事）。
+- 種類：「名稱」（查詢是產品或模型的專有名詞，講它的發表、評測、跟進）、「事件」（查詢是主角加關鍵字，講某件具體發生的事）、「籠統」（講的是 OpenAI、Google 這種整家公司，或整個領域，沒有一件具體的事）。
 - 話題：繁體中文 15 字內，講這件事（例：「Jev 決策模型爆紅」「五角大廈承認 AI 導致誤炸」）。
 
 回傳 JSON：{"結果":[{"編號":1,"AI":true,"主角":"Jev","查詢":"Jev","種類":"名稱","話題":"Jev 決策模型爆紅"}]}
@@ -134,6 +138,8 @@ const mostCommon = (xs: string[]) => {
 const MERGE_PROMPT = `下面是一批 AI 新聞話題，每個話題有編號、主角、一篇代表文章標題。有些其實是同一件事，只是主角寫法不同
 （例：「Pentagon」「Palantir」「US Military」三個都在講美軍 AI 系統導致伊朗學校誤炸；「GPT-6」和「GPT-6 Sol」都在講 GPT-6 Sol/Luna 發表）。
 請找出「講的是同一件具體的事」的話題組。只是同一家公司、同一個領域的不算，要是同一個產品發表、同一個事件。
+同一次一起發表的幾個產品算同一件（例：「Claude Fable 5.2」和「Mythos 5.2」是同一天一起發表的）。
+主角一樣但事情不一樣的不要併（例：「Claude Code 外洩密碼」和「高盛禁用 Claude Code」是兩件事）。
 回傳 JSON：{"合併":[[3,17,42],[5,9]]}，每組是編號陣列，沒有要合併的就回 {"合併":[]}。只回 JSON。`
 
 async function mergeSameEvent(groups: Map<string, { idx: number; e: Extracted }[]>, articles: Article[]): Promise<void> {
@@ -142,7 +148,7 @@ async function mergeSameEvent(groups: Map<string, { idx: number; e: Extracted }[
   const list = keys
     .map((k, i) => {
       const g = groups.get(k)!
-      return `[${i + 1}] 主角：${g[0].e.主角}｜${articles[g[0].idx].標題.slice(0, 90)}`
+      return `[${i + 1}] 主角：${g[0].e.主角}｜查詢：${g[0].e.查詢}｜${articles[g[0].idx].標題.slice(0, 90)}`
     })
     .join('\n')
   let sets: number[][] = []
@@ -181,11 +187,13 @@ export async function clusterTopics(articles: Article[]): Promise<Omit<Topic, '�
   // 把原因帶出去：線上 OpenRouter 金鑰失效（401）時，畫面只寫「每一批都失敗了」，看不出是金鑰的問題（2026-10-29）
   if (failed === offsets.length) throw new Error(`每一批都失敗了（${llmErrorMessage(lastErr)}）`)
 
-  // 照主角分組（大小寫不分）
+  // 照主角分組（大小寫不分）。事件類再加上查詢：同一個主角可以同時出好幾件事——
+  // 2026-11-10「Claude Code 外洩密碼」和「高盛禁用 Claude Code」主角都是 Claude Code，被併成一個話題，外洩那件從板上消失。
+  // 事件類拆得太細（同一件事查詢寫法不同）交給 mergeSameEvent 併回去。
   const groups = new Map<string, { idx: number; e: Extracted }[]>()
   for (const m of maps)
     for (const [idx, e] of m) {
-      const key = e.主角.toLowerCase()
+      const key = (e.種類 === '事件' ? `${e.主角}|${e.查詢}` : e.主角).toLowerCase()
       const g = groups.get(key)
       if (g) g.push({ idx, e })
       else groups.set(key, [{ idx, e }])
@@ -217,10 +225,15 @@ export async function clusterTopics(articles: Article[]): Promise<Omit<Topic, '�
     const b = 必含.toLowerCase()
     // 主角是 Trump、China 這種大詞也可以算事件，只要查詢裡還有別的具體字（「Trump super intelligence」）：
     // 比對時標題要同時有 Trump 和那個字，不會把所有川普新聞都算進來；剩下的誤中交給 verifyMatches 打折。
-    const others = 查詢.split(/\s+/).filter((w) => w.toLowerCase() !== b && !GENERIC.has(w.toLowerCase()))
-    const properEvent = /^[A-Z0-9]/.test(必含) && !GENERIC.has(b) && others.length >= (BROAD.has(b) ? 1 : 0) && 查詢.split(/\s+/).length >= 2
+    const own = new Set(b.split(/\s+/))
+    const others = 查詢.split(/\s+/).filter((w) => !own.has(w.toLowerCase()) && !GENERIC.has(w.toLowerCase()))
+    // 主角是 Anthropic、Nvidia 這種公司名也可以算事件，只要查詢裡還有別的具體字（「Anthropic IPO」）：
+    // 比對時標題要同時有公司名和那個字，不會把整家公司的新聞都算進來。
+    // 2026-11-10 以前公司名一律算籠統：「Anthropic 準備上市」5 家在報，卻不拿去外部查熱度、還打對折，排到第 11。
+    const wide = BROAD.has(b) || GENERIC.has(b)
+    const properEvent = /^[A-Z0-9]/.test(必含) && others.length >= (wide ? 1 : 0) && 查詢.split(/\s+/).length >= 2
     const 種類: Topic['種類'] =
-      GENERIC.has(q) || GENERIC.has(b)
+      GENERIC.has(q) || (GENERIC.has(b) && !(kind === '事件' && properEvent))
         ? '籠統'
         : kind === '名稱'
           ? '名稱'
@@ -262,7 +275,10 @@ const HN_DAYS = 10 // 7 天會漏掉話題的起點：Jev 發表文剛好是第 
 function matches(title: string, t: Pick<Topic, '查詢' | '必含' | '種類'>): boolean {
   if (!mentions(title, t.必含)) return false
   if (t.種類 === '名稱') return true
-  const others = t.查詢.split(/\s+/).filter((w) => w && w.toLowerCase() !== t.必含.toLowerCase())
+  // 主角自己的字不算「其他的字」：主角「Claude Code」、查詢「Claude Code secrets」，只看 secrets，
+  // 不然任何有 Claude Code 的標題都會配到外洩那件事
+  const own = new Set(t.必含.toLowerCase().split(/\s+/))
+  const others = t.查詢.split(/\s+/).filter((w) => w && !own.has(w.toLowerCase()))
   return !others.length || others.some((w) => mentions(title, w))
 }
 
