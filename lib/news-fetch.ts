@@ -1,4 +1,4 @@
-// 抓最近一週的 AI 新聞 → 併成話題 → 用外部熱度排序 → 最熱的幾個寫摘要 → 回傳候選（不寫表，留前端）
+// 抓最近三天的 AI／自動化新聞 → 併成話題 → 用外部熱度排序 → 最熱的幾個寫摘要 → 回傳候選（不寫表，留前端）
 // 走 lib/llm-json 的共用入口：有 OPENROUTER_API_KEY 就用 OpenRouter，沒有才退回 Groq。
 // 別直接呼叫 getGroqClient——那會繞過這個切換，把請求全打在 Groq 的免費額度上（實測整輪 429）。
 //
@@ -10,7 +10,6 @@ import { chatJSON, llmErrorMessage } from '@/lib/llm-json'
 import { twTime } from '@/lib/news'
 import { cleanStoryText } from '@/lib/hn-fetch'
 import { clusterTopics, rankTopics, zhCoverage, type Article, type Heat, type Topic } from '@/lib/news-trending'
-import { threadsTopics } from '@/lib/news-threads'
 
 type Feed = { name: string; track: string; url: string; max?: number } // max：這條收幾則，預設 PER_FEED
 
@@ -35,19 +34,16 @@ export type Candidate = {
   改寫建議: string
 }
 
-// 所有來源一律看 7 天：話題會紅一整週（Jev 9/15 發表、9/23 還是最熱），
-// 兩天的窗口只看得到話題的尾巴或開頭。熱度另外由 lib/news-trending 量，這裡只負責「找到有哪些事」。
-const MAX_AGE_DAYS = 7
+// 2026-11-10 使用者講清楚新聞板的初衷只有三點：最新、熱門、只要 AI／自動化。
+// 「最新」：窗口從 7 天縮成 3 天，再加上 withFreshness 照天數打折。熱度另外由 lib/news-trending 量。
+const MAX_AGE_DAYS = 3
 
 // 來源只負責「發現話題」，排序不看來源。所以這裡要的是覆蓋面，不是純度：
 // 以前為了「只收第一手」拿掉聚合來源，連帶丟掉最重要的訊號——很多地方同時在講。
 const FEEDS: Feed[] = [
-  // —— 熱門聚合：別人已經幫忙挑過「今天在紅什麼」——
-  // The Rundown AI 是每日 AI 日報，實測 2026-09-23 標題就有 Jev、Muse、AI 放緩爭論，舊來源清單全漏
-  { name: 'The Rundown AI', track: 'AI/LLM', url: 'https://rss.beehiiv.com/feeds/2R3C6Bt5wj.xml' },
-  // Google News 的 AI 主流報導：只當「發現話題」用（連結是轉址，代表連結排最後，見 representative）。
-  // 沒有這條的話，「AI 大廠呼籲放緩」「Gemini 測試中連上外部系統」這種主流媒體大篇幅報、工程圈來源沒寫的事整個看不到。
-  { name: 'Google News AI', track: '國際科技', url: 'https://news.google.com/rss/search?q=%22artificial+intelligence%22+OR+AI+when:3d&hl=en-US&gl=US&ceid=US:en', max: 60 },
+  // 2026-11-10 拿掉聚合（The Rundown AI 日報、Google News AI）和觀點電子報（Stratechery、Latent Space…）：
+  // 使用者要「最新，所以盡量不要被整理過的」——日報、評論是別人整理過、慢半拍的二手貨。
+  // 主流媒體有沒有在報，還是由 lib/news-trending 的 Google News 篇數量，不靠這裡收。
   // —— AI 官方第一手：話題的「原文連結」優先用這些 ——
   { name: 'OpenAI 官方', track: 'AI/LLM', url: 'https://openai.com/news/rss.xml' },
   { name: 'Google Gemini 官方', track: 'AI/LLM', url: 'https://blog.google/products/gemini/rss/' },
@@ -60,16 +56,8 @@ const FEEDS: Feed[] = [
   // —— 社群一手 ——
   { name: 'r/LocalLLaMA', track: 'AI/LLM', url: 'https://www.reddit.com/r/LocalLLaMA/top/.rss?t=week' },
   { name: 'Simon Willison', track: 'AI/LLM', url: 'https://simonwillison.net/atom/everything/' },
-  // —— 觀點：只留幾個大的。它們很少自己帶出新話題，但會跟著熱門話題寫，算進「多少地方在講」——
-  // 2026-09-17 加的 18 條觀點 newsletter 砍掉大半：保底 6 個名額讓畫面塞滿冷門長文（SemiAnalysis 的 DRAM offloading），
-  // 被使用者嫌「全部都不是我要的」。
-  { name: 'Stratechery', track: 'AI 趨勢觀點', url: 'https://stratechery.com/feed/' },
-  { name: 'Latent Space', track: 'AI 趨勢觀點', url: 'https://www.latent.space/feed' },
-  { name: 'Interconnects', track: 'AI 趨勢觀點', url: 'https://www.interconnects.ai/feed' },
-  { name: 'One Useful Thing', track: 'AI 趨勢觀點', url: 'https://www.oneusefulthing.org/feed' },
-  { name: 'Gary Marcus', track: 'AI 趨勢觀點', url: 'https://garymarcus.substack.com/feed' },
-  { name: 'MIT Tech Review AI', track: 'AI 趨勢觀點', url: 'https://www.technologyreview.com/topic/artificial-intelligence/feed' },
-  // —— 國際科技媒體 ——
+  // —— 國際科技媒體（什麼都報，靠 isAIRelated 只留 AI／自動化）——
+  { name: 'MIT Tech Review AI', track: '國際科技', url: 'https://www.technologyreview.com/topic/artificial-intelligence/feed' },
   { name: 'TechCrunch', track: '國際科技', url: 'https://techcrunch.com/feed/' },
   { name: 'The Verge', track: '國際科技', url: 'https://www.theverge.com/rss/index.xml' },
   { name: 'Ars Technica', track: '國際科技', url: 'https://feeds.arstechnica.com/arstechnica/index' },
@@ -81,6 +69,8 @@ const FEEDS: Feed[] = [
   // —— 台灣中文 ——
   { name: '中央社科技', track: '台灣科技', url: 'https://feeds.feedburner.com/rsscna/technology' },
   { name: 'iThome', track: '台灣科技', url: 'https://www.ithome.com.tw/rss' },
+  { name: 'INSIDE', track: '台灣科技', url: 'https://www.inside.com.tw/feed/rss' },
+  { name: '科技新報', track: '台灣科技', url: 'https://technews.tw/feed/', max: 40 }, // 一天四五十篇，大半是財經股市
   // 政府公告不在這裡，見 GOV_FEEDS
 ]
 
@@ -408,7 +398,7 @@ function isFresh(發布時間: string): boolean {
 }
 
 export type FetchReport = {
-  模式: string // 「Threads 爆點」或退回的「新聞來源」，前端要講清楚這次是怎麼找的
+  模式: string // 這次是怎麼找的（目前固定「第一手來源」），前端會顯示
   抓到: number
   話題: number
   來源: { 名稱: string; 收下: number; 狀態: string }[]
@@ -431,7 +421,19 @@ async function fetchOne(f: Feed | Scraper) {
   }
 }
 
-// 抓所有來源、依網址去重、只留 7 天內的。scripts/news-eval.ts、scripts/news-push.ts 也用這支。
+// 「只要 AI／自動化，其他完全不管」：綜合科技媒體、HN 什麼都有，先用關鍵字擋掉，省得送去給 LLM 併話題。
+// 寬一點沒關係（併話題那步的 LLM 還會再丟一次跟 AI 無關的），但不能漏掉真的 AI 新聞。
+// 英文短詞用 \b 包住，免得 AI 撞到 said、agent 撞到 agency。
+const AI_ONLY_SOURCES = new Set([
+  'OpenAI 官方', 'Google Gemini 官方', 'Google DeepMind', 'Hugging Face', 'r/LocalLLaMA', 'Simon Willison', 'n8n 官方', 'Lobsters', 'Anthropic 官方',
+])
+const AI_RE =
+  /\b(AI|AGI|LLMs?|GPT[-\w.]*|ChatGPT|OpenAI|Anthropic|Claude|Gemini|DeepMind|Copilot|Codex|Llama|Mistral|Qwen|DeepSeek|Grok|xAI|Hugging ?Face|Nvidia|GPUs?|TPUs?|agents?|agentic|chatbots?|prompts?|automation|automated|n8n|Zapier|MCP|RAG|inference|fine-tun\w*|neural|machine learning|generative|diffusion|transformers?)\b|A\.I\.|人工智慧|生成式|模型|機器學習|深度學習|代理|自動化|聊天機器人|提示詞|輝達|算力|機器人/i
+function isAIRelated(p: Parsed): boolean {
+  return AI_ONLY_SOURCES.has(p.來源) || AI_RE.test(`${p.標題} ${p.摘要.slice(0, 300)}`)
+}
+
+// 抓所有來源、依網址去重、只留 3 天內、跟 AI／自動化有關的。scripts/news-eval.ts、scripts/news-push.ts 也用這支。
 export async function collectArticles(): Promise<{ articles: Parsed[]; 來源: FetchReport['來源'] }> {
   const [hn, lobsters, ...rest] = await Promise.all([
     fetchHackerNews(),
@@ -449,7 +451,7 @@ export async function collectArticles(): Promise<{ articles: Parsed[]; 來源: F
   for (const g of groups) {
     let n = 0
     for (const p of g.items) {
-      if (seen.has(p.原文連結) || !isFresh(p.發布時間)) continue
+      if (seen.has(p.原文連結) || !isFresh(p.發布時間) || !isAIRelated(p)) continue
       seen.add(p.原文連結)
       articles.push(p)
       n++
@@ -572,20 +574,12 @@ function withFreshness(topics: Topic[]): Topic[] {
     .sort((a, b) => b.熱度 - a.熱度)
 }
 
-// 找熱門話題：照「Threads 上會不會爆」排（見 lib/news-threads），再照新舊打折（見 withFreshness）。
-// 失敗或找不到東西就退回新聞來源那套（先抓新聞、再量熱度），板子不會空掉。
+// 找熱門話題：讀第一手來源 → 併話題 → 用客觀熱度（幾個來源在報、HN 分數、報導篇數）排 → 照新舊打折。
+// 2026-11-10 拿掉「Threads 爆點」那條（lib/news-threads）：它拿「AI 深偽」「AI 詐騙」「ChatGPT 死亡」這類
+// 二十組聳動關鍵字搜台灣新聞，使用者看了非常討厭。新聞板要的是最新、熱門、AI／自動化，不是社會新聞。
 export async function hotTopics(): Promise<{ topics: Topic[]; 模式: string; articles: number; 來源: FetchReport['來源'] }> {
-  try {
-    const raw = await threadsTopics()
-    const topics = withFreshness(raw)
-    if (topics.length >= 3) return { topics, 模式: 'Threads 爆點', articles: topics.reduce((n, t) => n + t.文章.length, 0), 來源: [] }
-  } catch (e) {
-    const rl = asRateLimit(e)
-    if (rl) throw rl
-    console.error('[news] Threads 爆點失敗，退回新聞來源：', String(e).slice(0, 200))
-  }
   const r = await trendingTopics()
-  return { topics: withFreshness(r.topics), 模式: '新聞來源（Threads 爆點那條失敗）', articles: r.articles, 來源: r.來源 }
+  return { topics: withFreshness(r.topics), 模式: '第一手來源', articles: r.articles, 來源: r.來源 }
 }
 
 // 話題 → 候選：挑代表連結、找台灣中文報導、寫摘要
